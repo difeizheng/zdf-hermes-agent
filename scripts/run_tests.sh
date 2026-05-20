@@ -31,6 +31,9 @@ for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agen
   if [ -f "$candidate/bin/activate" ]; then
     VENV="$candidate"
     break
+  elif [ -f "$candidate/Scripts/activate" ]; then
+    VENV="$candidate"
+    break
   fi
 done
 
@@ -39,7 +42,12 @@ if [ -z "$VENV" ]; then
   exit 1
 fi
 
-PYTHON="$VENV/bin/python"
+# Windows uses Scripts/python.exe, POSIX uses bin/python
+if [ -f "$VENV/Scripts/python.exe" ]; then
+  PYTHON="$VENV/Scripts/python.exe"
+else
+  PYTHON="$VENV/bin/python"
+fi
 
 # ── Ensure pytest-split is installed (required for shard-equivalent runs) ──
 if ! "$PYTHON" -c "import pytest_split" 2>/dev/null; then

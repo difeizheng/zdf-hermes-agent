@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from coordinator.config import load_config
 from coordinator.db import TaskDB
 from coordinator.events import TaskEventBroadcaster
+from coordinator.kanban_sync import sync_create, sync_status, backfill_all as _kanban_backfill
 from coordinator.metrics import MetricsCollector
 from coordinator.models import TaskCreate, TaskEvent, TaskStatus, TaskUpdate
 
@@ -42,6 +43,11 @@ async def lifespan(app: FastAPI):
     db = TaskDB(db_path)
     broadcaster = TaskEventBroadcaster()
     metrics = MetricsCollector()
+
+    # Backfill existing tasks to Kanban (idempotent, skips already-synced)
+    backfilled = _kanban_backfill()
+    if backfilled:
+        logger.info("Kanban backfill: %d tasks synced", backfilled)
 
     # Start background monitors
     monitor = asyncio.create_task(_stale_task_monitor())
@@ -102,7 +108,25 @@ async def create_task(task_in: TaskCreate):
         data={"title": task.title},
     )
     _get_metrics().record_task_created(task.type.value)
+    sync_create(str(task.id), task.type.value, task.title, task.description)
     return task
+
+
+@app.get("/tasks/events")
+def event_stream(
+    type: Optional[str] = Query(None),
+    task_id: Optional[str] = Query(None),
+):
+    """SSE stream of task events."""
+    return StreamingResponse(
+        _ensure_broadcaster().sse_stream(task_type=type, task_id=task_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/tasks")
@@ -174,6 +198,8 @@ async def submit_result(task_id: str, req: ResultRequest):
         task_type=task.type.value,
         data={"error": req.error} if req.error else {"artifacts": req.artifacts},
     )
+    new_status = "failed" if req.error else "completed"
+    sync_status(str(task_id), new_status)
     return task
 
 
@@ -209,25 +235,6 @@ async def upload_artifact(task_id: str, name: str, request: Request):
     target.mkdir(parents=True, exist_ok=True)
     (target / name).write_bytes(body)
     return {"status": "ok", "path": str(target / name)}
-
-
-# -- SSE endpoint --------------------------------------------------------------
-
-@app.get("/tasks/events")
-def event_stream(
-    type: Optional[str] = Query(None),
-    task_id: Optional[str] = Query(None),
-):
-    """SSE stream of task events."""
-    return StreamingResponse(
-        _ensure_broadcaster().sse_stream(task_type=type, task_id=task_id),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
 
 
 # -- health --------------------------------------------------------------------

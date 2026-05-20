@@ -16,7 +16,8 @@ def _hermes_home() -> Path:
     env = os.environ.get("HERMES_HOME")
     if env:
         return Path(env)
-    return Path.home() / ".hermes"
+    home = os.environ.get("HOME") or os.path.expanduser("~")
+    return Path(home) / ".hermes"
 
 
 def load_config() -> dict[str, Any]:

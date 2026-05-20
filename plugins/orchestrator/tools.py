@@ -64,7 +64,7 @@ def _coordinator_url() -> str:
     return cfg.get("coordinator_url", "http://localhost:9100")
 
 
-def orchestrate_handler(args: dict) -> str:
+def orchestrate_handler(args: dict, **kwargs) -> str:
     import json
 
     action = args.get("action", "")

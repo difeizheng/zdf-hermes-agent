@@ -177,7 +177,7 @@ Brain waits for completion, reports progress to user
 DingTalk response: "任务已创建，设计阶段进行中..."
 ```
 
-**Implementation:** Custom Hermes skill (`skills/brain-orchestrator/`) + tool handler registered via `tools/registry.py`.
+**Implementation:** Custom Hermes plugin (`plugins/orchestrator/`) with `orchestrate` tool + `pre_gateway_dispatch` hook for DingTalk routing. Slash command: `/orchestrator`.
 
 ### 4.2 Design Agent
 
@@ -346,11 +346,11 @@ Brain receives SSE event
 - [ ] Write integration tests
 
 ### Phase 2: Brain Agent + DingTalk Integration (Week 2)
-- [ ] Create `skills/brain-orchestrator/` skill definition
-- [ ] Implement task decomposition logic in Hermes
-- [ ] Register `orchestrate` tool via `tools/registry.py`
-- [ ] Wire DingTalk voice → Whisper STT → Brain Agent
-- [ ] Test: voice command → task creation → DingTalk response
+- [x] Create `plugins/orchestrator/` plugin with `orchestrate` tool
+- [x] Implement `pre_gateway_dispatch` hook for DingTalk message routing
+- [x] Register `/orchestrator` slash command for manual task management
+- [x] DingTalk voice → Whisper STT → Brain Agent (existing gateway STT pipeline)
+- [x] Test: voice command → task creation → DingTalk response
 
 ### Phase 3: Dev Agent Integration (Week 3)
 - [ ] Claude Code non-interactive invocation wrapper
@@ -435,8 +435,11 @@ hermes-agent/
 │   ├── models.py              # Pydantic task models
 │   ├── db.py                  # SQLite CRUD
 │   └── events.py              # SSE event broadcaster
-├── tools/
-│   └── orchestrate_tool.py    # Hermes tool for task dispatch
+├── plugins/
+│   └── orchestrator/
+│       ├── __init__.py              # Plugin entry, pre_gateway_dispatch hook
+│       ├── config.py                # Orchestrator config
+│       └── tools.py                 # orchestrate tool (HTTP client to coordinator)
 ├── skills/
 │   └── brain-orchestrator/
 │       ├── skill.yaml           # Skill definition

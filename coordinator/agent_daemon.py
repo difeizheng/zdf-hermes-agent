@@ -31,12 +31,17 @@ class AgentDaemon:
     async def run(self) -> None:
         """Main daemon loop."""
         self._running = True
-        loop = asyncio.get_event_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, self._stop)
+        import sys
+        if sys.platform != "win32":
+            loop = asyncio.get_event_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, self._stop)
 
         sse_url = f"{self.coordinator_url}/tasks/events?type={self.agent_type}"
         logger.info("Agent daemon starting: type=%s, id=%s", self.agent_type, self.agent_id)
+
+        # Claim any leftover pending tasks on startup
+        await self._recover_pending_tasks()
 
         while self._running:
             try:
@@ -101,3 +106,24 @@ class AgentDaemon:
     async def execute_task(self, task_id: str) -> dict[str, Any]:
         """Override in subclass."""
         raise NotImplementedError
+
+    async def _recover_pending_tasks(self) -> None:
+        """Claim any pending tasks left over from previous runs."""
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.get(
+                    f"{self.coordinator_url}/tasks",
+                    params={"status": "pending", "type": self.agent_type},
+                )
+                resp.raise_for_status()
+                tasks = resp.json()
+            if not tasks:
+                logger.info("No pending tasks to recover")
+                return
+            logger.info("Recovering %d pending tasks", len(tasks))
+            for task in tasks:
+                if not self._running:
+                    break
+                await self._claim_and_execute(task["id"])
+        except Exception:
+            logger.exception("Failed to recover pending tasks")

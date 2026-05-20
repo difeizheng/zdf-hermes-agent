@@ -41,7 +41,10 @@ async def run_validate_task(task_id: str, coordinator_url: str) -> dict[str, Any
     branch = f"feature/{dep_id}"
 
     # Checkout branch
-    worktree_dir = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "tasks" / str(task_id) / "worktree"
+    _home = os.environ.get("HERMES_HOME")
+    if not _home:
+        _home = os.environ.get("HOME") or os.path.expanduser("~") + "/.hermes"
+    worktree_dir = Path(_home) / "tasks" / str(task_id) / "worktree"
     worktree_dir.mkdir(parents=True, exist_ok=True)
 
     await _checkout_branch(repo_path, branch, worktree_dir)
@@ -53,7 +56,10 @@ async def run_validate_task(task_id: str, coordinator_url: str) -> dict[str, Any
     test_results = await _run_tests(worktree_dir, metadata.get("test_command"))
 
     # Write review artifact
-    artifact_dir = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "tasks" / str(task_id) / "artifacts"
+    _home2 = os.environ.get("HERMES_HOME")
+    if not _home2:
+        _home2 = os.environ.get("HOME") or os.path.expanduser("~") + "/.hermes"
+    artifact_dir = Path(_home2) / "tasks" / str(task_id) / "artifacts"
     artifact_dir.mkdir(parents=True, exist_ok=True)
     (artifact_dir / "review.md").write_text(review, encoding="utf-8")
 

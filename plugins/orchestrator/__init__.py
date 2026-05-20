@@ -8,9 +8,11 @@ Registers:
 
 from __future__ import annotations
 
+import logging
 from plugins.orchestrator.config import load_orchestrator_config
 from plugins.orchestrator.tools import register_tools
 
+logger = logging.getLogger(__name__)
 
 def register(ctx) -> None:
     cfg = load_orchestrator_config()
@@ -28,15 +30,21 @@ def register(ctx) -> None:
 
 def _on_gateway_dispatch(event, gateway, session_store, **_):
     """Route DingTalk messages into Brain mode when orchestrator is enabled."""
-    if event.platform != "dingtalk":
+    source = event.source
+    platform = source.platform.value if source.platform else "unknown"
+    logger.info("pre_gateway_dispatch hook called: platform=%s, text=%s", platform, (event.text or "")[:50])
+    if platform != "dingtalk":
         return None
     text = event.text or ""
-    # Group @mentions or /task prefix trigger orchestration
     if text.startswith("/task ") or _looks_like_task(text):
-        event.text = (
-            "You are the Brain orchestrator. Use the `orchestrate` tool with "
-            f"action=create to handle this request:\n\n{text}"
-        )
+        logger.info("Task detected, returning rewrite action")
+        return {
+            "action": "rewrite",
+            "text": (
+                "You are the Brain orchestrator. Use the `orchestrate` tool with "
+                f"action=create to handle this request:\n\n{text}"
+            ),
+        }
     return None
 
 

@@ -42,7 +42,10 @@ async def run_deploy_task(task_id: str, coordinator_url: str) -> dict[str, Any]:
     branch = f"feature/{dep_id}"
 
     # Checkout branch
-    worktree_dir = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "tasks" / str(task_id) / "worktree"
+    _home = os.environ.get("HERMES_HOME")
+    if not _home:
+        _home = os.environ.get("HOME") or os.path.expanduser("~") + "/.hermes"
+    worktree_dir = Path(_home) / "tasks" / str(task_id) / "worktree"
     worktree_dir.mkdir(parents=True, exist_ok=True)
 
     subprocess.run(

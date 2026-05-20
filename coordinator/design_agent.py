@@ -24,7 +24,8 @@ def _hermes_home() -> Path:
     env = os.environ.get("HERMES_HOME")
     if env:
         return Path(env)
-    return Path.home() / ".hermes"
+    home = os.environ.get("HOME") or os.path.expanduser("~")
+    return Path(home) / ".hermes"
 
 
 async def run_design_task(task_id: str, coordinator_url: str) -> dict[str, Any]:

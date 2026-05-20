@@ -106,7 +106,7 @@ _DINGTALK_WEBHOOK_RE = re.compile(r'^https://(?:api|oapi)\.dingtalk\.com/')
 # DingTalk message type → runtime content type
 DINGTALK_TYPE_MAPPING = {
     "picture": "image",
-    "voice": "audio",
+    "voice": "voice",
 }
 
 
@@ -642,8 +642,65 @@ class DingTalkAdapter(BasePlatformAdapter):
         # Extract text content
         text = self._extract_text(message)
 
+        # For voice messages, extract recognition text from content dict
+        voice_content = getattr(message, "content", None)
+        if isinstance(voice_content, dict):
+            recognition = voice_content.get("recognition", "")
+            if recognition and not text:
+                text = recognition
+
         # Determine message type and build media list
         msg_type, media_urls, media_types = self._extract_media(message)
+
+        # Determine message type and build media list
+        msg_type, media_urls, media_types = self._extract_media(message)
+
+        # Download remote voice URLs / resolve download codes to local cache
+        if msg_type == MessageType.VOICE and media_urls:
+            local_paths = []
+            for val in media_urls:
+                # Handle dict content (extract downloadCode)
+                if isinstance(val, dict):
+                    val = val.get("downloadCode") or val.get("download_code", "")
+                if isinstance(val, str) and val.startswith("http"):
+                    # Already a resolved URL — download to local cache
+                    try:
+                        from gateway.platforms.base import cache_audio_from_url
+                        local_path = await cache_audio_from_url(val, ext=".ogg")
+                        local_paths.append(local_path)
+                        logger.info(
+                            "[%s] Cached voice message at %s", self.name, local_path,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "[%s] Failed to cache voice from URL: %s",
+                            self.name, e,
+                        )
+                        local_paths.append(val)  # fallback: keep remote URL
+                else:
+                    # Download code — resolve via DingTalk API then download
+                    try:
+                        resolved_url = await self._resolve_single_download_code(val)
+                        if resolved_url:
+                            from gateway.platforms.base import cache_audio_from_url
+                            local_path = await cache_audio_from_url(resolved_url, ext=".ogg")
+                            local_paths.append(local_path)
+                            logger.info(
+                                "[%s] Resolved download code %s → cached at %s",
+                                self.name, val[:20], local_path,
+                            )
+                        else:
+                            logger.warning(
+                                "[%s] Failed to resolve voice download code: %s",
+                                self.name, val[:20],
+                            )
+                            local_paths.append(val)
+                    except Exception as e:
+                        logger.warning(
+                            "[%s] Voice code resolution failed: %s", self.name, e,
+                        )
+                        local_paths.append(val)
+            media_urls = local_paths
 
         if not text and not media_urls:
             logger.debug("[%s] Empty message, skipping", self.name)
@@ -771,6 +828,10 @@ class DingTalkAdapter(BasePlatformAdapter):
                                 media_types.append("image")
                                 if msg_type == MessageType.TEXT:
                                     msg_type = MessageType.PHOTO
+                            elif mapped == "voice":
+                                media_types.append("audio")
+                                if msg_type == MessageType.TEXT:
+                                    msg_type = MessageType.VOICE
                             elif mapped == "audio":
                                 media_types.append("audio")
                                 if msg_type == MessageType.TEXT:
@@ -785,6 +846,22 @@ class DingTalkAdapter(BasePlatformAdapter):
                                     msg_type = MessageType.DOCUMENT
 
         msg_type_str = getattr(message, "message_type", "") or ""
+        # Standalone voice/voice-like message — content field can be:
+        #  - a dict with "downloadCode" key (voice from DingTalk)
+        #  - a download code string
+        #  - a resolved URL (after _resolve_media_codes)
+        if msg_type_str in ("voice", "audio") and not media_urls:
+            voice_val = getattr(message, "content", None)
+            if isinstance(voice_val, dict):
+                dl_code = voice_val.get("downloadCode") or voice_val.get("download_code", "")
+                if dl_code:
+                    media_urls.append(dl_code)
+                    media_types.append("audio")
+                    msg_type = MessageType.VOICE
+            elif voice_val:
+                media_urls.append(voice_val)
+                media_types.append("audio")
+                msg_type = MessageType.VOICE
         if msg_type_str == "picture" and not media_urls:
             msg_type = MessageType.PHOTO
         elif msg_type_str == "richText":
@@ -1286,6 +1363,18 @@ class DingTalkAdapter(BasePlatformAdapter):
         if img_content and getattr(img_content, "download_code", None):
             codes_to_resolve.append((img_content, "download_code"))
 
+        # 1b. Voice message content (DingTalk SDK: msgtype="voice"/"audio", content=dict with downloadCode)
+        msg_type_str = getattr(message, "message_type", "") or ""
+        if msg_type_str in ("voice", "audio"):
+            voice_content = getattr(message, "content", None)
+            if isinstance(voice_content, dict):
+                dl_code = voice_content.get("downloadCode") or voice_content.get("download_code", "")
+                if dl_code:
+                    codes_to_resolve.append((voice_content, "downloadCode" if "downloadCode" in voice_content else "download_code"))
+            elif voice_content:
+                # Plain string download code
+                codes_to_resolve.append((message, "content"))
+
         # 2. Rich text list
         rich_text = getattr(message, "rich_text_content", None)
         if rich_text:
@@ -1309,6 +1398,34 @@ class DingTalkAdapter(BasePlatformAdapter):
                 )
 
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _resolve_single_download_code(self, code: str) -> str | None:
+        """Resolve a single download code to a download URL.
+
+        Returns the URL or None if resolution fails.
+        """
+        token = await self._get_access_token()
+        if not token or not self._robot_sdk:
+            return None
+        robot_code = self._client_id
+        try:
+            request = dingtalk_robot_models.RobotMessageFileDownloadRequest(
+                download_code=code,
+                robot_code=robot_code,
+            )
+            headers = dingtalk_robot_models.RobotMessageFileDownloadHeaders(
+                x_acs_dingtalk_access_token=token,
+            )
+            runtime = tea_util_models.RuntimeOptions()
+            response = await self._robot_sdk.robot_message_file_download_with_options_async(
+                request, headers, runtime
+            )
+            body = response.body if response else None
+            if body:
+                return getattr(body, "download_url", None)
+        except Exception as e:
+            logger.warning("[%s] Resolve download code failed: %s", self.name, e)
+        return None
 
     async def _fetch_download_url(
         self, code: str, robot_code: str, token: str, obj, key: str
@@ -1447,6 +1564,14 @@ class _IncomingHandler(
                 )
                 if raw_flag:
                     chatbot_msg.is_in_at_list = True
+
+            # Ensure content (download code for voice/audio messages) is mapped.
+            # DingTalk sends audio content as a download code in the "content" field,
+            # which from_dict() does not extract.
+            if not getattr(chatbot_msg, "content", None):
+                raw_content = data.get("content") if isinstance(data, dict) else None
+                if raw_content:
+                    chatbot_msg.content = raw_content
 
             msg_id = getattr(chatbot_msg, "message_id", None) or ""
             conversation_id = getattr(chatbot_msg, "conversation_id", None) or ""

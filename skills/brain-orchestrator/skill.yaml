@@ -1,0 +1,33 @@
+name: brain-orchestrator
+version: "1.0.0"
+description: Multi-agent task orchestrator. Parses intent, decomposes into task DAGs, dispatches to specialized agents.
+author: Hermes Agent Team
+category: orchestration
+
+triggers:
+  - pattern: "(开发|实现|设计|构建|部署|create|build|design|implement|deploy|develop)"
+    description: Requests to create, design, implement, or deploy software features
+
+tools:
+  - name: orchestrate
+    description: Create, list, status, and cancel orchestrated tasks
+    source: "plugins/orchestrator/tools.py"
+
+config:
+  prompt_file: "prompt.md"
+  default_coordinator_url: "http://localhost:9100"
+  max_concurrent_tasks: 3
+
+task_types:
+  design:
+    agent: "Design Agent (Claude API)"
+    description: Architecture planning, PRD, system design
+  dev:
+    agent: "Dev Agent (Claude Code)"
+    description: Code implementation
+  validate:
+    agent: "Validate Agent (Codex)"
+    description: Code review, test execution, security audit
+  deploy:
+    agent: "Deploy Agent (Claude Code)"
+    description: CI/CD pipeline, packaging, release
