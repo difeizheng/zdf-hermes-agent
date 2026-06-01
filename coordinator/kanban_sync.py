@@ -26,6 +26,13 @@ _STATUS_MAP = {
     "timeout": "blocked",
 }
 
+_TASK_TYPE_CN = {
+    "design": "设计",
+    "dev": "开发",
+    "validate": "验证",
+    "deploy": "部署",
+}
+
 
 def _get_conn():
     """Get Kanban connection, or None if unavailable."""
@@ -37,15 +44,27 @@ def _get_conn():
         return None
 
 
+def _find_by_session(conn, task_id: str):
+    """Find a Kanban task by session_id (which stores the coordinator task_id)."""
+    if not _KANBAN_AVAILABLE:
+        return None
+    try:
+        tasks = kb.list_tasks(conn, session_id=task_id)
+        return tasks[0] if tasks else None
+    except Exception:
+        return None
+
+
 def sync_create(task_id: str, task_type: str, title: str, description: str) -> None:
     """Mirror a new coordinator task in Kanban."""
     conn = _get_conn()
     if conn is None:
         return
     try:
+        type_label = _TASK_TYPE_CN.get(task_type, task_type)
         kb.create_task(
             conn,
-            title=f"[{task_type}] {title}",
+            title=f"[{type_label}] {title}",
             body=description,
             assignee=task_type,
             session_id=task_id,
@@ -58,7 +77,7 @@ def sync_create(task_id: str, task_type: str, title: str, description: str) -> N
                 kb.unblock_task(conn, task.id)
             except Exception:
                 pass
-        logger.info("Kanban sync: created task %s", task_id)
+        logger.info("Kanban 同步: 创建任务 %s", task_id)
     except Exception:
         logger.exception("Kanban sync create failed for %s", task_id)
 
@@ -74,9 +93,9 @@ def sync_status(task_id: str, status: str) -> None:
         if task is None:
             return
         if kanban_status == "done":
-            kb.complete_task(conn, task.id, summary=f"Coordinator task {task_id} completed")
+            kb.complete_task(conn, task.id, summary=f"任务 {task_id} 完成")
         elif kanban_status == "blocked":
-            kb.block_task(conn, task.id, reason=f"Coordinator task {task_id} {status}")
+            kb.block_task(conn, task.id, reason=f"任务 {task_id} {status}")
         elif kanban_status == "running":
             # Kanban has no explicit 'running' -> 'running' transition API,
             # task is already in running state from create
@@ -85,15 +104,25 @@ def sync_status(task_id: str, status: str) -> None:
         logger.exception("Kanban sync status failed for %s", task_id)
 
 
-def _find_by_session(conn, task_id: str):
-    """Find a Kanban task by session_id (which stores the coordinator task_id)."""
-    if not _KANBAN_AVAILABLE:
-        return None
+def sync_heartbeat(task_id: str) -> None:
+    """Update Kanban task heartbeat timestamp."""
+    import time
+    conn = _get_conn()
+    if conn is None:
+        return
     try:
-        tasks = kb.list_tasks(conn, session_id=task_id)
-        return tasks[0] if tasks else None
+        task = _find_by_session(conn, task_id)
+        if task is None:
+            return
+        # Kanban stores last_heartbeat_at as UNIX epoch integer
+        conn.execute(
+            "UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?",
+            (int(time.time()), task.id),
+        )
+        conn.commit()
+        logger.debug("Kanban heartbeat: %s", task_id)
     except Exception:
-        return None
+        pass  # heartbeat is non-critical, don't fail
 
 
 def backfill_all() -> int:
@@ -112,10 +141,12 @@ def backfill_all() -> int:
         tasks = db.list_tasks()
         count = 0
         for t in tasks:
-            if _find_by_session(conn, str(t.id)) is None:
+            existing = _find_by_session(conn, str(t.id))
+            if existing is None:
+                type_label = _TASK_TYPE_CN.get(t.type.value, t.type.value)
                 kb.create_task(
                     conn,
-                    title=f"[{t.type.value}] {t.title}",
+                    title=f"[{type_label}] {t.title}",
                     body=t.description,
                     assignee=t.type.value,
                     session_id=str(t.id),
@@ -129,9 +160,27 @@ def backfill_all() -> int:
                     except Exception:
                         pass
                 count += 1
+            elif existing.status != _STATUS_MAP.get(t.status.value, "triage"):
+                # Kanban exists but status is stale — resync
+                _apply_status(conn, existing, t.status.value)
         db.close()
         logger.info("Kanban backfill: %d tasks synced", count)
         return count
     except Exception:
         logger.exception("Kanban backfill failed")
         return 0
+
+
+def _apply_status(conn, task, coordinator_status: str) -> None:
+    """Apply coordinator status to existing Kanban task."""
+    kanban_status = _STATUS_MAP.get(coordinator_status, "triage")
+    try:
+        if kanban_status == "done":
+            kb.complete_task(conn, task.id, summary=f"任务已完成")
+        elif kanban_status == "blocked":
+            kb.block_task(conn, task.id, reason=f"任务 {coordinator_status}")
+        elif kanban_status == "running":
+            pass  # already in running from create
+        logger.info("Kanban task %s status synced to %s", task.id, kanban_status)
+    except Exception:
+        logger.exception("Kanban status apply failed for task %s", task.id)

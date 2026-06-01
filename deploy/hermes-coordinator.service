@@ -1,0 +1,29 @@
+[Unit]
+Description=Hermes Orchestrator Coordinator
+After=network.target
+
+[Service]
+Type=simple
+User=hermes
+Group=hermes
+WorkingDirectory=/opt/hermes-agent
+Environment=PATH=/opt/hermes-agent/.venv/bin:/usr/local/bin:/usr/bin
+Environment=HERMES_HOME=/var/lib/hermes
+ExecStart=/opt/hermes-agent/.venv/bin/python -m uvicorn coordinator.server:app \
+    --host 0.0.0.0 \
+    --port 9100 \
+    --log-level info
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=3
+StartLimitIntervalSec=60
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/hermes
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

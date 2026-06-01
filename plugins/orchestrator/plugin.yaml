@@ -1,0 +1,14 @@
+name: orchestrator
+description: Multi-agent orchestration with coordinator task DAG.
+source: python
+module: plugins.orchestrator
+entrypoint: register
+# Note: Despite the name, this field is advisory only. The plugin's
+# `register()` function bails out unless `orchestrator.enabled: true`
+# is explicitly set in ~/.hermes/config.yaml. To enable:
+#   orchestrator:
+#     enabled: true
+#     coordinator_url: "http://localhost:9100"
+# Leaving it disabled (default) means DingTalk messages fall through to
+# the standard Brain Agent without multi-agent decomposition.
+enabled_by_default: false

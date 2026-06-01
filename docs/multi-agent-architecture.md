@@ -123,7 +123,6 @@ This proves the pattern: Hermes can serve as an MCP stdio server for any client.
 # tasks.db (SQLite)
 CREATE TABLE tasks (
     id          TEXT PRIMARY KEY,           -- UUID
-    parent_id   TEXT,                       -- parent task (for nesting)
     type        TEXT NOT NULL,              -- design | dev | validate | deploy
     status      TEXT NOT NULL,              -- pending | running | completed | failed | cancelled
     title       TEXT NOT NULL,

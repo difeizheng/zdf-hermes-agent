@@ -28,7 +28,7 @@ def load_config() -> dict[str, Any]:
         "db_path": str(_hermes_home() / "tasks.db"),
         "heartbeat_interval": 60,
         "stale_timeout": 120,
-        "artifact_dir": str(_hermes_home() / "tasks"),
+        "workspace_dir": "D:/hermes/workspace",
         "max_retries": 0,
         "retry_delay": 30,
     }

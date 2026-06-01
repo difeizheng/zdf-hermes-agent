@@ -37,12 +37,12 @@ async def lifespan(app: FastAPI):
     cfg = load_config()
     db_path = Path(cfg["db_path"])
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    artifact_dir = Path(cfg["artifact_dir"])
-    artifact_dir.mkdir(parents=True, exist_ok=True)
 
     db = TaskDB(db_path)
     broadcaster = TaskEventBroadcaster()
     metrics = MetricsCollector()
+
+    # Backfill existing tasks to Kanban (idempotent, skips already-synced)
 
     # Backfill existing tasks to Kanban (idempotent, skips already-synced)
     backfilled = _kanban_backfill()
@@ -92,6 +92,7 @@ class ClaimRequest(BaseModel):
 
 class ResultRequest(BaseModel):
     artifacts: Optional[dict] = None
+    metadata: Optional[dict] = None
     error: Optional[str] = None
 
 
@@ -155,6 +156,8 @@ async def claim_task(task_id: str, req: ClaimRequest):
     task = _ensure_db().claim_task(task_id, req.agent_id)
     if task is None:
         raise HTTPException(409, "Task not claimable (not pending or not found)")
+    # Audit log
+    _ensure_db().add_event(task_id, TaskEvent.STARTED, {"agent_id": req.agent_id})
     await _ensure_broadcaster().publish(
         TaskEvent.STARTED,
         task_id=str(task_id),
@@ -167,8 +170,10 @@ async def claim_task(task_id: str, req: ClaimRequest):
 
 @app.patch("/tasks/{task_id}")
 def update_task(task_id: str, update: TaskUpdate):
-    """Update task status / assignment."""
-    if update.status:
+    """Update task status, assignment, or dependencies."""
+    if update.depends_on is not None:
+        task = _ensure_db().update_task_dependencies(task_id, update.depends_on)
+    elif update.status:
         task = _ensure_db().update_task_status(task_id, update.status, update.assigned_to)
     else:
         task = _ensure_db().get_task(task_id)
@@ -179,11 +184,24 @@ def update_task(task_id: str, update: TaskUpdate):
 
 @app.post("/tasks/{task_id}/result")
 async def submit_result(task_id: str, req: ResultRequest):
-    """Submit task completion or failure."""
-    task = _ensure_db().submit_result(task_id, req.artifacts, req.error)
+    """Submit task completion or failure.
+
+    The Brain Agent is responsible for creating the full task chain
+    (design → dev → validate → deploy) upfront. This endpoint only:
+    1. Updates task status in DB (including _resolve_dependencies)
+    2. Records audit event
+    3. Publishes SSE event for status change
+    4. Syncs to Kanban
+
+    No auto-chaining — that logic was removed to eliminate race conditions
+    between the Brain's manual chain and the coordinator's auto-chain.
+    """
+    task = _ensure_db().submit_result(task_id, req.artifacts, req.error, metadata=req.metadata)
     if task is None:
         raise HTTPException(404, "Task not found")
     event_type = TaskEvent.FAILED if req.error else TaskEvent.COMPLETED
+    # Audit log
+    _ensure_db().add_event(task_id, event_type, {"error": req.error} if req.error else {"artifacts": req.artifacts})
     if req.error:
         _get_metrics().record_task_failed(task.type.value, "execution_error")
     else:
@@ -200,6 +218,7 @@ async def submit_result(task_id: str, req: ResultRequest):
     )
     new_status = "failed" if req.error else "completed"
     sync_status(str(task_id), new_status)
+
     return task
 
 
@@ -207,20 +226,31 @@ async def submit_result(task_id: str, req: ResultRequest):
 def heartbeat(task_id: str):
     """Update task heartbeat."""
     _ensure_db().update_heartbeat(task_id)
+    from coordinator.kanban_sync import sync_heartbeat
+    sync_heartbeat(task_id)
     return {"status": "ok"}
+
+
+@app.get("/tasks/{task_id}/history")
+def get_task_history(task_id: str):
+    """Get audit log of all events for a task."""
+    task = _ensure_db().get_task(task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    events = _ensure_db().get_events_since(task_id)
+    return events
 
 
 @app.get("/tasks/{task_id}/artifacts")
 def get_artifacts(task_id: str):
-    """Read artifact file from disk."""
+    """Read artifact files from disk."""
     task = _ensure_db().get_task(task_id)
     if task is None:
         raise HTTPException(404, "Task not found")
-    artifact_dir = Path(cfg["artifact_dir"])
+    workspace_dir = Path(cfg.get("workspace_dir", "D:/hermes/workspace")) / str(task_id) / "artifacts"
     artifacts = {}
-    base = artifact_dir / str(task_id) / "artifacts"
-    if base.exists():
-        for f in base.iterdir():
+    if workspace_dir.exists():
+        for f in workspace_dir.iterdir():
             if f.is_file():
                 artifacts[f.name] = f.read_text(encoding="utf-8")
     return artifacts
@@ -230,11 +260,10 @@ def get_artifacts(task_id: str):
 async def upload_artifact(task_id: str, name: str, request: Request):
     """Write artifact file to disk."""
     body = await request.body()
-    artifact_dir = Path(cfg["artifact_dir"])
-    target = artifact_dir / str(task_id) / "artifacts"
-    target.mkdir(parents=True, exist_ok=True)
-    (target / name).write_bytes(body)
-    return {"status": "ok", "path": str(target / name)}
+    workspace_dir = Path(cfg.get("workspace_dir", "D:/hermes/workspace")) / str(task_id) / "artifacts"
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    (workspace_dir / name).write_bytes(body)
+    return {"status": "ok", "path": str(workspace_dir / name)}
 
 
 # -- health --------------------------------------------------------------------
@@ -255,7 +284,14 @@ def metrics_endpoint():
 # -- background monitors -------------------------------------------------------
 
 async def _stale_task_monitor() -> None:
-    """Check for stale tasks every 30s, mark as TIMEOUT."""
+    """Check for stale tasks every 30s, mark as TIMEOUT.
+
+    After marking a task TIMEOUT, calls _resolve_dependencies so that
+    any dependent tasks are not permanently blocked. This handles the
+    case where an agent process crashes (OOM, kill -9, machine power
+    loss) and the task stays in 'running' state forever without this
+    monitor triggering dependency resolution.
+    """
     while True:
         await asyncio.sleep(30)
         try:
@@ -263,6 +299,8 @@ async def _stale_task_monitor() -> None:
             stale_tasks = _ensure_db().get_stale_tasks(stale_timeout)
             for task in stale_tasks:
                 _ensure_db().update_task_status(task.id, TaskStatus.TIMEOUT)
+                # Resolve dependencies so dependents are not permanently blocked
+                _ensure_db()._resolve_dependencies(str(task.id))
                 await _ensure_broadcaster().publish(
                     TaskEvent.TIMEOUT,
                     task_id=str(task.id),
@@ -276,20 +314,30 @@ async def _stale_task_monitor() -> None:
 
 
 async def _dependency_monitor() -> None:
-    """On task completion, broadcast 'ready' for newly-satisfied tasks."""
-    last_known_count = 0
+    """On task completion, broadcast 'ready' for newly-satisfied tasks.
+
+    Tracks notified task IDs to avoid re-publishing events for tasks that
+    were already announced. Previous count-based logic missed new ready tasks
+    when the total count didn't exceed the previous peak (e.g. after tasks
+    were claimed and new ones became ready).
+    """
+    notified_ids: set[str] = set()
     while True:
         await asyncio.sleep(5)
         try:
             ready_tasks = _ensure_db().get_ready_tasks()
-            if len(ready_tasks) > last_known_count:
-                for task in ready_tasks:
+            current_ids = {str(t.id) for t in ready_tasks}
+            # Publish events only for newly-ready tasks
+            for task in ready_tasks:
+                if str(task.id) not in notified_ids:
                     await _ensure_broadcaster().publish(
                         TaskEvent.CREATED,
                         task_id=str(task.id),
                         task_type=task.type.value,
                         data={"title": task.title, "dependency_resolved": True},
                     )
-                last_known_count = len(ready_tasks)
+                    notified_ids.add(str(task.id))
+            # Prune IDs that are no longer ready (claimed or completed)
+            notified_ids -= notified_ids - current_ids
         except Exception:
             logger.exception("Dependency monitor error")

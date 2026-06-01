@@ -48,6 +48,7 @@ class TaskUpdate(BaseModel):
     artifacts: Optional[dict] = None
     error: Optional[str] = None
     assigned_to: Optional[str] = None
+    depends_on: Optional[list[str]] = None
 
 
 class Task(BaseModel):

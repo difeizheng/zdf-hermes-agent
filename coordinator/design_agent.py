@@ -63,15 +63,15 @@ async def run_design_task(task_id: str, coordinator_url: str) -> dict[str, Any]:
     # Call Claude API (use the LLM facade from plugin context or direct API)
     artifacts = await _call_claude_api(system_prompt, description)
 
-    # Write artifacts to disk
-    artifact_dir = Path(cfg["artifact_dir"]) / str(task_id) / "artifacts"
-    artifact_dir.mkdir(parents=True, exist_ok=True)
+    # Write artifacts to disk under configured workspace_dir
+    workspace_dir = Path(cfg.get("workspace_dir", "D:/hermes/workspace")) / str(task_id) / "artifacts"
+    workspace_dir.mkdir(parents=True, exist_ok=True)
 
     for name, content in artifacts.items():
-        (artifact_dir / name).write_text(content, encoding="utf-8")
+        (workspace_dir / name).write_text(content, encoding="utf-8")
 
     return {
-        "artifacts": {name: str(artifact_dir / name) for name in artifacts},
+        "artifacts": {name: str(workspace_dir / name) for name in artifacts},
         "metadata": {"model": "claude-opus-4-7", "title": title},
     }
 
@@ -110,37 +110,56 @@ async def _call_claude_api(system_prompt: str, user_content: str) -> dict[str, s
 def _parse_artifacts(text: str) -> dict[str, str]:
     """Parse Claude response into separate artifact files.
 
-    Splits by section headers. If no clear sections found, puts everything in one file.
+    Splits by markdown headers (## Title). Falls back to putting everything
+    in one file if no headers are found. Previous numbered-list splitting
+    was fragile and broke when Claude used heading-based formatting.
     """
+    import re
+
+    # Map common header keywords to canonical filenames
+    _NAME_MAP = {
+        "prd": "prd.md",
+        "product": "prd.md",
+        "requirements": "prd.md",
+        "architecture": "architecture.md",
+        "overview": "architecture.md",
+        "system": "system_design.md",
+        "design": "system_design.md",
+        "data model": "system_design.md",
+        "api": "system_design.md",
+    }
+
     sections: dict[str, str] = {}
-    current_section = "full_design"
-    current_content = []
+    current_name = "full_design.md"
+    current_lines: list[str] = []
 
     for line in text.split("\n"):
-        if line.strip().startswith(("1.", "2.", "3.")):
+        header_match = re.match(r'^(#{1,4})\s+(.+)', line)
+        if header_match:
             # Save previous section
-            sections[current_section] = "\n".join(current_content).strip()
-            current_section = line.strip().lower().replace(" ", "_")
-            current_content = []
+            content = "\n".join(current_lines).strip()
+            if content:
+                sections[current_name] = content
+            # Determine filename from header text
+            header_text = header_match.group(2).strip().lower()
+            current_name = "full_design.md"  # default
+            for keyword, filename in _NAME_MAP.items():
+                if keyword in header_text:
+                    current_name = filename
+                    break
+            current_lines = [line]
         else:
-            current_content.append(line)
+            current_lines.append(line)
 
     # Save last section
-    sections[current_section] = "\n".join(current_content).strip()
+    content = "\n".join(current_lines).strip()
+    if content:
+        sections[current_name] = content
 
-    # Clean up section names
-    cleaned = {}
-    for key, content in sections.items():
-        if content:
-            name = key.replace("prd", "prd").replace("architecture", "architecture").replace(
-                "system_design", "system_design"
-            )
-            cleaned[name] = content
+    if not sections:
+        sections = {"full_design.md": text}
 
-    if not cleaned:
-        cleaned = {"full_design.md": text}
-
-    return cleaned
+    return sections
 
 
 def _mock_artifacts(system_prompt: str, user_content: str) -> dict[str, str]:

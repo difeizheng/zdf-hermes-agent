@@ -25,7 +25,7 @@ async def main() -> None:
 
     class ValidateDaemon(AgentDaemon):
         async def execute_task(self, task_id):
-            return await run_validate_task(task_id, self.coordinator_url)
+            return await run_validate_task(task_id, self.coordinator_url, daemon=self)
 
     daemon = ValidateDaemon(
         agent_type="validate",

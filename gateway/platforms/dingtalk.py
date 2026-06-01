@@ -768,6 +768,10 @@ class DingTalkAdapter(BasePlatformAdapter):
         else:
             content = str(text).strip()
 
+        # Debug: log text extraction shape
+        logger.debug("[Dingtalk] _extract_text: text_attr_type=%s content=%r msg_type=%s",
+                      type(text).__name__, content, getattr(message, "msgtype", ""))
+
         if not content:
             rich_text = getattr(message, "rich_text_content", None) or getattr(
                 message, "rich_text", None

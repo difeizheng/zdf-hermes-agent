@@ -35,11 +35,3 @@ def broadcaster() -> TaskEventBroadcaster:
 def metrics_collector() -> MetricsCollector:
     """Fresh metrics collector."""
     return MetricsCollector()
-
-
-@pytest.fixture
-def test_artifact_dir(tmp_path: Path) -> Path:
-    """Temporary artifact directory."""
-    d = tmp_path / "artifacts"
-    d.mkdir()
-    return d

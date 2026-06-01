@@ -152,6 +152,42 @@ See `hermes claw migrate --help` for all options, or use the `openclaw-migration
 
 ---
 
+## Multi-Agent Orchestrator
+
+Send a DingTalk voice or text message, and the Brain Agent decomposes the request into Design → Dev → Validate → Deploy tasks, orchestrating all agents via the MCP Coordinator Server.
+
+### Quick Start
+
+```bash
+# Option A: Supervisor (dev, cross-platform)
+python scripts/supervisor.py start --background
+python scripts/supervisor.py status
+python scripts/supervisor.py logs -f
+python scripts/supervisor.py stop
+
+# Windows shortcut
+scripts\orchestrator.bat start
+
+# Option B: systemd (Linux production)
+sudo bash deploy/setup-systemd.sh /opt/hermes-agent
+
+# Option C: Docker Compose
+cp deploy/.env.example .env
+docker compose -f deploy/docker-compose.yml up -d
+```
+
+### Required Config
+```yaml
+# ~/.hermes/config.yaml
+orchestrator:
+  enabled: true
+  coordinator_url: "http://localhost:9100"
+```
+
+Full architecture: [docs/multi-agent-architecture.md](docs/multi-agent-architecture.md)
+
+---
+
 ## Contributing
 
 We welcome contributions! See the [Contributing Guide](https://hermes-agent.nousresearch.com/docs/developer-guide/contributing) for development setup, code style, and PR process.

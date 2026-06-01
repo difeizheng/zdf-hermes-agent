@@ -148,14 +148,14 @@ class TaskDB:
         with self._lock:
             now = "CURRENT_TIMESTAMP"
             fields = []
-            vals: list = [status.value]
+            vals: list[object] = []
             if status == TaskStatus.RUNNING:
-                fields.append("started_at = ?")
-                vals.append(now)
+                fields.append("started_at = CURRENT_TIMESTAMP")
             if assigned_to is not None:
                 fields.append("assigned_to = ?")
                 vals.append(assigned_to)
             fields.append("status = ?")
+            vals.append(status.value)
             vals.append(task_id)
             self._conn.execute(
                 f"UPDATE tasks SET {', '.join(fields)} WHERE id = ?", vals
@@ -163,9 +163,48 @@ class TaskDB:
             self._conn.commit()
             return self.get_task(task_id)
 
-    def claim_task(self, task_id: int | str, agent_id: str) -> Optional[Task]:
-        """Atomic CAS: pending → running with assigned_to."""
+    def update_task_dependencies(self, task_id: int | str, depends_on: list[str]) -> Optional[Task]:
+        """Replace all dependencies of task_id with new depends_on list. Recomputes dependency_status."""
         with self._lock:
+            # Delete existing dependencies
+            self._conn.execute(
+                "DELETE FROM task_dependencies WHERE task_id = ?", (task_id,)
+            )
+            # Insert new dependencies
+            for dep_id in depends_on:
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO task_dependencies (task_id, depends_on) VALUES (?, ?)",
+                    (task_id, dep_id),
+                )
+            # Recompute dependency_status
+            unsatisfied = self._conn.execute(
+                "SELECT 1 FROM task_dependencies td "
+                "JOIN tasks t ON t.id = td.depends_on "
+                "WHERE td.task_id = ? AND t.status != 'completed' LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            dep_status = "blocked" if unsatisfied else "satisfied"
+            self._conn.execute(
+                "UPDATE tasks SET dependency_status = ? WHERE id = ?",
+                (dep_status, task_id),
+            )
+            self._conn.commit()
+            return self.get_task(task_id)
+
+    def claim_task(self, task_id: int | str, agent_id: str) -> Optional[Task]:
+        """Atomic CAS: pending → running with assigned_to. Only if all deps completed."""
+        with self._lock:
+            # Verify all dependencies are completed
+            cur = self._conn.execute(
+                "SELECT COUNT(*) FROM task_dependencies td "
+                "LEFT JOIN tasks t ON t.id = td.depends_on "
+                "WHERE td.task_id = ? AND (t.status IS NULL OR t.status != 'completed')",
+                (task_id,),
+            )
+            incomplete = cur.fetchone()[0]
+            if incomplete > 0:
+                return None
+
             cur = self._conn.execute(
                 "UPDATE tasks SET status = 'running', started_at = CURRENT_TIMESTAMP, "
                 "assigned_to = ?, last_heartbeat_at = CURRENT_TIMESTAMP "
@@ -182,6 +221,7 @@ class TaskDB:
         task_id: int | str,
         artifacts: Optional[dict] = None,
         error: Optional[str] = None,
+        metadata: Optional[dict] = None,
     ) -> Optional[Task]:
         with self._lock:
             status = TaskStatus.FAILED if error else TaskStatus.COMPLETED
@@ -193,6 +233,9 @@ class TaskDB:
             if error is not None:
                 fields.append("error = ?")
                 vals.insert(-1, error)
+            if metadata is not None:
+                fields.append("metadata = ?")
+                vals.insert(-1, json.dumps(metadata))
             self._conn.execute(
                 f"UPDATE tasks SET {', '.join(fields)} WHERE id = ?", vals
             )
@@ -242,26 +285,74 @@ class TaskDB:
             self._conn.commit()
 
     def _resolve_dependencies(self, completed_task_id: int | str) -> None:
-        """When a task completes, check if blocked tasks become satisfied."""
+        """When a task completes or enters a terminal state, check if blocked tasks become satisfied.
+
+        Terminal states: completed, cancelled, timeout, failed.
+        This ensures that when an agent crashes (→ timeout), its dependents
+        are not permanently blocked. The downstream agent's own retry logic
+        will handle the missing work.
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info("_resolve_dependencies called for task: %s", completed_task_id)
+
         # Find all tasks that depend on the completed task
         rows = self._conn.execute(
             "SELECT td.task_id FROM task_dependencies td "
             "WHERE td.depends_on = ?",
             (completed_task_id,),
         ).fetchall()
+        logger.info("_resolve_dependencies found %d dependent tasks", len(rows))
         for (dependent_id,) in rows:
             unsatisfied = self._conn.execute(
                 "SELECT 1 FROM task_dependencies td "
                 "JOIN tasks t ON t.id = td.depends_on "
-                "WHERE td.task_id = ? AND t.status NOT IN ('completed', 'cancelled')",
+                "WHERE td.task_id = ? AND t.status NOT IN ('completed', 'cancelled', 'timeout', 'failed')",
                 (dependent_id,),
             ).fetchone()
             if unsatisfied is None:
+                logger.info("All dependencies satisfied for task %s", dependent_id)
                 self._conn.execute(
                     "UPDATE tasks SET dependency_status = 'satisfied' WHERE id = ?",
                     (dependent_id,),
                 )
+            else:
+                logger.info("Task %s still has unsatisfied dependencies", dependent_id)
         self._conn.commit()
+
+    def resolve_dependencies_for_task(self, task_id: int | str) -> str:
+        """Recompute dependency_status for a specific task based on its deps' states.
+
+        Used when a task is created AFTER its dependencies have already been
+        satisfied (e.g., validate retry creates dev_retry after original_dev
+        has already completed). Without this call, the new task stays in
+        'blocked' state forever because _resolve_dependencies is only invoked
+        on task completion, not on task creation.
+
+        Terminal states: completed, cancelled, timeout, failed — all unblock dependents.
+
+        Returns the new dependency_status ("satisfied" or "blocked").
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+        with self._lock:
+            unsatisfied = self._conn.execute(
+                "SELECT 1 FROM task_dependencies td "
+                "JOIN tasks t ON t.id = td.depends_on "
+                "WHERE td.task_id = ? AND t.status NOT IN ('completed', 'cancelled', 'timeout', 'failed')",
+                (task_id,),
+            ).fetchone()
+            dep_status = "blocked" if unsatisfied else "satisfied"
+            self._conn.execute(
+                "UPDATE tasks SET dependency_status = ? WHERE id = ?",
+                (dep_status, task_id),
+            )
+            self._conn.commit()
+            logger.info(
+                "Manually resolved dependencies for task %s → %s",
+                str(task_id)[:8], dep_status,
+            )
+            return dep_status
 
     def get_ready_tasks(self, task_type: Optional[str] = None) -> list[Task]:
         """Return pending tasks whose dependencies are all satisfied."""

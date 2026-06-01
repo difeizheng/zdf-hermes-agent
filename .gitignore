@@ -73,3 +73,20 @@ models-dev-upstream/
 hermes_cli/tui_dist/*
 hermes_cli/scripts/
 docs/superpowers/*
+
+# User-specific Windows launchers and scheduled task scripts
+# (these hardcode absolute paths to one machine's checkout)
+run_hermes.bat
+scripts/start_hermes.bat
+scripts/start_chrome_monitor.bat
+scripts/create_hermes_gateway_task.ps1
+scripts/create_hermes_tui_task.ps1
+0.36.0
+latest_session.txt
+latest_task_id.txt
+session_dump.txt
+all_tool_calls.txt
+coordinator.log
+
+# Claude Code local runtime state
+.claude/

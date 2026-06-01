@@ -31,9 +31,6 @@ def client(tmp_db: TaskDB, tmp_path: Path) -> TestClient:
     """Create TestClient with test DB injected, lifespan disabled."""
     import coordinator.server as srv
 
-    artifact_dir = tmp_path / "artifacts"
-    artifact_dir.mkdir()
-
     # Save original globals to restore after test
     original_db = srv.db
     original_broadcaster = srv.broadcaster
@@ -49,7 +46,6 @@ def client(tmp_db: TaskDB, tmp_path: Path) -> TestClient:
         "db_path": str(tmp_db.db_path),
         "heartbeat_interval": 60,
         "stale_timeout": 120,
-        "artifact_dir": str(artifact_dir),
         "max_retries": 0,
         "retry_delay": 30,
     }

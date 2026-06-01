@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Hermes Agent** — self-improving AI agent by Nous Research. Python 3.11+ project with a Node.js TUI frontend. Version 0.14.0.
+**Hermes Agent** — self-improving AI agent by Nous Research. Python 3.11+ project with a Node.js TUI frontend. Version 1.0.0.
 
 Key surfaces:
 - Interactive CLI (prompt_toolkit + Rich)
@@ -166,6 +166,66 @@ Always use `get_hermes_home()` for code paths and `display_hermes_home()` for us
 - Scripts in `scripts/`, references in `references/`, templates in `templates/`.
 - Tests at `tests/skills/test_<skill>_skill.py` — stdlib + pytest + mock only, no network calls.
 - Heavy/niche skills go in `optional-skills/`, not `skills/`.
+
+## Orchestrator Deployment
+
+All code for multi-agent orchestration is implemented (Phases 1-5 complete). Use one of three methods to start:
+
+### Option A: Python Supervisor (cross-platform, recommended for dev)
+
+```bash
+# Start coordinator + 4 agents in background
+python scripts/supervisor.py start --background
+
+# Check status
+python scripts/supervisor.py status
+
+# View logs
+python scripts/supervisor.py logs --follow
+
+# Stop everything
+python scripts/supervisor.py stop
+```
+
+Windows shortcut: `scripts\orchestrator.bat start`
+
+### Option B: systemd (Linux production)
+
+```bash
+sudo bash deploy/setup-systemd.sh /opt/hermes-agent
+
+# Individual service management
+sudo systemctl [start|stop|restart|status] hermes-coordinator
+sudo systemctl [start|stop|restart|status] hermes-agent@design
+sudo journalctl -u hermes-coordinator -f
+```
+
+### Option C: Docker Compose
+
+```bash
+cp deploy/.env.example .env    # set API keys
+docker compose -f deploy/docker-compose.yml up -d
+docker compose -f deploy/docker-compose.yml logs -f coordinator
+```
+
+### Required Config
+
+```yaml
+# ~/.hermes/config.yaml
+orchestrator:
+  enabled: true
+  coordinator_url: "http://localhost:9100"
+  workspace_dir: "D:/hermes/workspace"    # all agent output goes here
+```
+
+### Workspace Layout
+
+```
+D:/hermes/workspace/
+└── {task_id}/
+    ├── artifacts/          # Design/Validate output (prd.md, review.md, etc.)
+    └── worktree/           # Dev/Deploy git worktree
+```
 
 ## TUI Architecture
 

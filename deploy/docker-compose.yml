@@ -1,0 +1,139 @@
+services:
+  coordinator:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+      target: app
+    image: hermes-agent:latest
+    container_name: hermes-coordinator
+    ports:
+      - "9100:9100"
+    environment:
+      - COORDINATOR_PORT=9100
+      - HERMES_HOME=/data/hermes
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - DINGTALK_CLIENT_ID=${DINGTALK_CLIENT_ID}
+      - DINGTALK_CLIENT_SECRET=${DINGTALK_CLIENT_SECRET}
+    volumes:
+      - hermes-data:/data/hermes
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9100/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    networks:
+      - hermes-net
+
+  agent-design:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+      target: app
+    image: hermes-agent:latest
+    container_name: hermes-agent-design
+    environment:
+      - HERMES_HOME=/data/hermes
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - NO_PROXY=coordinator,127.0.0.1,localhost
+    volumes:
+      - hermes-data:/data/hermes
+    command: >
+      python scripts/run_design_agent.py
+        --agent-id design-1
+        --coordinator-url http://coordinator:9100
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - hermes-net
+
+  agent-dev:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+      target: app
+    image: hermes-agent:latest
+    container_name: hermes-agent-dev
+    environment:
+      - HERMES_HOME=/data/hermes
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - NO_PROXY=coordinator,127.0.0.1,localhost
+      - GIT_AUTHOR_NAME=${GIT_AUTHOR_NAME:-hermes-dev}
+      - GIT_AUTHOR_EMAIL=${GIT_AUTHOR_EMAIL:-hermes@local}
+    volumes:
+      - hermes-data:/data/hermes
+      - ${REPO_PATH:-.}:/workspace:rw
+    command: >
+      python scripts/run_dev_agent.py
+        --agent-id dev-1
+        --coordinator-url http://coordinator:9100
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - hermes-net
+
+  agent-validate:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+      target: app
+    image: hermes-agent:latest
+    container_name: hermes-agent-validate
+    environment:
+      - HERMES_HOME=/data/hermes
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - NO_PROXY=coordinator,127.0.0.1,localhost
+    volumes:
+      - hermes-data:/data/hermes
+      - ${REPO_PATH:-.}:/workspace:rw
+    command: >
+      python scripts/run_validate_agent.py
+        --agent-id validate-1
+        --coordinator-url http://coordinator:9100
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - hermes-net
+
+  agent-deploy:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+      target: app
+    image: hermes-agent:latest
+    container_name: hermes-agent-deploy
+    environment:
+      - HERMES_HOME=/data/hermes
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - NO_PROXY=coordinator,127.0.0.1,localhost
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - DOCKER_REGISTRY=${DOCKER_REGISTRY}
+    volumes:
+      - hermes-data:/data/hermes
+      - ${REPO_PATH:-.}:/workspace:rw
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: >
+      python scripts/run_deploy_agent.py
+        --agent-id deploy-1
+        --coordinator-url http://coordinator:9100
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - hermes-net
+
+volumes:
+  hermes-data:
+    driver: local
+
+networks:
+  hermes-net:
+    driver: bridge

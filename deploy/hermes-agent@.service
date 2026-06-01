@@ -1,0 +1,30 @@
+[Unit]
+Description=Hermes Orchestrator Agent - %i
+After=hermes-coordinator.service
+Wants=hermes-coordinator.service
+
+[Service]
+Type=simple
+User=hermes
+Group=hermes
+WorkingDirectory=/opt/hermes-agent
+Environment=PATH=/opt/hermes-agent/.venv/bin:/usr/local/bin:/usr/bin
+Environment=HERMES_HOME=/var/lib/hermes
+Environment=NO_PROXY=127.0.0.1,localhost
+ExecStart=/opt/hermes-agent/.venv/bin/python scripts/run_%i_agent.py \
+    --agent-id %i-1 \
+    --coordinator-url http://localhost:9100
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=3
+StartLimitIntervalSec=60
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/hermes
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

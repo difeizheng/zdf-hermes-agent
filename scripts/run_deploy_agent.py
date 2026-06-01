@@ -25,7 +25,7 @@ async def main() -> None:
 
     class DeployDaemon(AgentDaemon):
         async def execute_task(self, task_id):
-            return await run_deploy_task(task_id, self.coordinator_url)
+            return await run_deploy_task(task_id, self.coordinator_url, daemon=self)
 
     daemon = DeployDaemon(
         agent_type="deploy",
