@@ -143,43 +143,56 @@ class MemorySystem:
         return self.write(entry)
 
     def _parse_memory_file(self, file_path: Path, category: str) -> MemoryEntry:
-        """Parse a memory file into MemoryEntry."""
-        content = file_path.read_text(encoding="utf-8")
+        """Parse a memory file into MemoryEntry.
 
-        # Parse frontmatter
+        Uses regex to match ``^---$`` boundary lines, avoiding false splits
+        when the body itself contains ``---`` (e.g. markdown tables, SQL).
+        """
+        import re
+
+        raw = file_path.read_text(encoding="utf-8")
+
+        # Defaults
         name = file_path.stem
         created_at = datetime.now()
-        metadata = {}
+        metadata: dict[str, Any] = {}
+        description = ""
+        body = raw
 
-        if content.startswith("---"):
-            parts = content.split("---", 2)
-            if len(parts) >= 3:
-                frontmatter = parts[1].strip()
-                body = parts[2].strip()
+        # Match frontmatter delimited by ^---$ on their own line
+        fm_match = re.match(r"^---\s*\n(.*?)\n---\s*\n?(.*)", raw, re.DOTALL)
+        if fm_match:
+            frontmatter = fm_match.group(1)
+            body = fm_match.group(2).strip()
 
-                for line in frontmatter.split("\n"):
-                    if ":" in line:
-                        k, v = line.split(":", 1)
-                        k = k.strip()
-                        v = v.strip()
-                        if k == "name":
-                            name = v
-                        elif k == "created":
-                            try:
-                                created_at = datetime.fromisoformat(v)
-                            except Exception:
-                                pass
-                        else:
-                            metadata[k] = v
+            for line in frontmatter.split("\n"):
+                if ":" not in line:
+                    continue
+                k, v = line.split(":", 1)
+                k = k.strip()
+                v = v.strip()
+                if k == "name":
+                    name = v
+                elif k == "description":
+                    description = v
+                elif k == "created":
+                    try:
+                        created_at = datetime.fromisoformat(v)
+                    except Exception:
+                        pass
+                else:
+                    metadata[k] = v
 
-                content = body
+        # Preserve description in metadata so write→load roundtrip doesn't lose it
+        if description:
+            metadata["description"] = description
 
         return MemoryEntry(
             category=category,
             name=name,
-            content=content,
+            content=body,
             created_at=created_at,
-            metadata=metadata,
+            metadata=metadata if metadata else None,
         )
 
     def build_context_prompt(self, categories: list[str] | None = None) -> str:

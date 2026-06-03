@@ -65,3 +65,7 @@ def get_workspace_dir(cfg: dict[str, Any] | None = None) -> str:
     if cfg is None:
         cfg = load_config()
     return cfg.get("workspace_dir") or _default_workspace_dir()
+
+
+# Default model name — single constant to avoid hardcoding across agents.
+DEFAULT_MODEL = "claude-opus-4-8"

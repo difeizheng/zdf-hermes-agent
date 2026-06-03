@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Any
 
 
-@dataclass
+@dataclass(frozen=True)
 class ProfileConfig:
     """Profile configuration for a specific agent role."""
     name: str

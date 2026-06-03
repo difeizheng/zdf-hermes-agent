@@ -17,7 +17,7 @@ import httpx
 from coordinator.config import load_config as load_coordinator_config
 from coordinator.config import load_llm_config as _load_llm_config
 from coordinator.shared_heartbeat import start_heartbeat
-from coordinator.shared_helpers import get_workspace_dir
+from coordinator.shared_helpers import get_workspace_dir, DEFAULT_MODEL
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +115,7 @@ async def _execute_design(
 
     # Resolve actual model used for metadata
     llm = _load_llm_config()
-    actual_model = llm.get("model", "claude-opus-4-8")
+    actual_model = llm.get("model", DEFAULT_MODEL)
 
     # Write artifacts to disk under configured workspace_dir
     workspace_dir = Path(get_workspace_dir(cfg)) / str(task_id) / "artifacts"
@@ -149,7 +149,7 @@ async def _call_claude_api(
     """
     llm = _load_llm_config()
     api_key = llm.get("api_key")
-    model = llm.get("model", "claude-opus-4-8")
+    model = llm.get("model", DEFAULT_MODEL)
     max_tokens = llm.get("max_tokens", 8000)
     base_url = llm.get("base_url")
 
@@ -159,7 +159,7 @@ async def _call_claude_api(
 
     try:
         import anthropic
-        client_kwargs: dict[str, Any] = {"api_key": api_key}
+        client_kwargs: dict[str, Any] = {"api_key": api_key, "timeout": 300.0}
         if base_url:
             client_kwargs["base_url"] = base_url
 
@@ -170,11 +170,14 @@ async def _call_claude_api(
             model, base_url or "default", max_tokens,
         )
 
-        response = await client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_content}],
+        response = await asyncio.wait_for(
+            client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_content}],
+            ),
+            timeout=300,
         )
 
         text = response.content[0].text if response.content else ""

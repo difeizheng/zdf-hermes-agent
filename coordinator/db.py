@@ -61,16 +61,51 @@ CREATE INDEX IF NOT EXISTS idx_task_events_created ON task_events(created_at);
 
 
 class TaskDB:
-    """Thread-safe SQLite task store."""
+    """Thread-safe SQLite task store.
+
+    Locking pattern: all public methods acquire ``self._lock`` (RLock).
+    Internal ``_unlocked`` methods assume the caller already holds the lock.
+    RLock is used (vs Lock) so reentrant calls from within locked sections
+    don't deadlock — e.g. ``submit_result`` calls ``get_task`` internally.
+    """
 
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL;")
-        self._conn.execute("PRAGMA foreign_keys=ON;")
-        self._conn.executescript(_SCHEMA_DDL)
+        self._conn = self._create_connection(db_path)
+
+    @staticmethod
+    def _create_connection(db_path: Path) -> sqlite3.Connection:
+        """Create a new SQLite connection with WAL mode, FK enforcement, and schema init."""
+        conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+        conn.executescript(_SCHEMA_DDL)
+        return conn
+
+    def _ensure_connection(self) -> sqlite3.Connection:
+        """Verify the SQLite connection is healthy; reconnect if corrupted.
+
+        Called at the start of each public method. Uses ``PRAGMA integrity_check``
+        (fast — only checks page headers, not full data). On failure, closes the
+        stale connection and creates a new one.
+        """
+        try:
+            result = self._conn.execute("PRAGMA integrity_check(1)").fetchone()
+            if result and result[0] == "ok":
+                return self._conn
+        except sqlite3.Error:
+            pass
+        # Connection is broken — reconnect
+        import logging
+        logging.getLogger(__name__).warning("SQLite connection unhealthy, reconnecting")
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+        self._conn = self._create_connection(self.db_path)
+        return self._conn
 
     # -- helpers ----------------------------------------------------------------
 
@@ -97,6 +132,7 @@ class TaskDB:
 
     def create_task(self, task_in: TaskCreate) -> Task:
         with self._lock:
+            self._ensure_connection()
             task_id = str(uuid.uuid4())
             cur = self._conn.execute(
                 "INSERT INTO tasks (id, type, title, description, metadata) "
@@ -126,6 +162,7 @@ class TaskDB:
 
     def get_task(self, task_id: int | str) -> Optional[Task]:
         with self._lock:
+            self._ensure_connection()
             row = self._conn.execute(
                 "SELECT * FROM tasks WHERE id = ?", (task_id,)
             ).fetchone()
@@ -193,6 +230,7 @@ class TaskDB:
     def claim_task(self, task_id: int | str, agent_id: str) -> Optional[Task]:
         """Atomic CAS: pending → running with assigned_to. Only if all deps completed."""
         with self._lock:
+            self._ensure_connection()
             # Verify all dependencies are in terminal state (completed/cancelled/timeout/failed)
             # Note: failed/cancelled/timeout also unblock dependents (per resolve_dependencies_for_task)
             cur = self._conn.execute(
@@ -224,6 +262,7 @@ class TaskDB:
         metadata: Optional[dict] = None,
     ) -> Optional[Task]:
         with self._lock:
+            self._ensure_connection()
             status = TaskStatus.FAILED if error else TaskStatus.COMPLETED
             vals: list = [status.value, task_id]
             fields = ["status = ?", "completed_at = CURRENT_TIMESTAMP"]

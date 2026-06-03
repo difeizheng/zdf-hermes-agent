@@ -9,7 +9,6 @@ import asyncio
 import logging
 import os
 import shutil
-import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -121,14 +120,18 @@ async def run_deploy_task(
                 import shutil
                 shutil.rmtree(workspace_dir, ignore_errors=True)
             try:
-                subprocess.run(
-                    ["git", "-C", repo_path, "worktree", "add", "--detach", str(workspace_dir), commit_sha],
-                    capture_output=True, text=True, timeout=30, check=True,
+                proc = await asyncio.create_subprocess_exec(
+                    "git", "-C", repo_path, "worktree", "add", "--detach", str(workspace_dir), commit_sha,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                 )
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+                if proc.returncode != 0:
+                    raise RuntimeError(stderr.decode("utf-8", errors="replace"))
                 logger.info("Created worktree at %s for commit %s", workspace_dir, commit_sha)
-            except subprocess.CalledProcessError as e:
+            except Exception as e:
                 # Fallback: use the directory as-is if worktree creation fails
-                logger.warning("Failed to create worktree, using existing directory: %s", e.stderr)
+                logger.warning("Failed to create worktree, using existing directory: %s", e)
                 workspace_dir.mkdir(parents=True, exist_ok=True)
     else:
         workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -174,8 +177,8 @@ async def _run_deploy(
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_get_timeout("deploy_timeout", 3600))
         return {
             "exit_code": proc.returncode,
-            "output": stdout.decode()[:4096],
-            "error": stderr.decode()[:4096],
+            "output": stdout.decode("utf-8", errors="replace")[:4096],
+            "error": stderr.decode("utf-8", errors="replace")[:4096],
         }
     except Exception as e:
         return {"error": str(e)}
@@ -203,11 +206,13 @@ async def _deploy_docker(
 
     has_compose = False
     try:
-        result = subprocess.run(
-            [docker_exe, "compose", "version"],
-            capture_output=True, text=True, timeout=10,
+        proc = await asyncio.create_subprocess_exec(
+            docker_exe, "compose", "version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        has_compose = result.returncode == 0
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        has_compose = proc.returncode == 0
     except Exception:
         pass
 
@@ -234,9 +239,9 @@ async def _deploy_docker(
         if daemon is not None and task_id is not None:
             daemon.register_subprocess(task_id, proc)
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_get_timeout("test_timeout", 600))
-        output_parts.append(stdout.decode()[:2048])
+        output_parts.append(stdout.decode("utf-8", errors="replace")[:2048])
         if stderr:
-            output_parts.append("STDERR: " + stderr.decode()[:2048])
+            output_parts.append("STDERR: " + stderr.decode("utf-8", errors="replace")[:2048])
         if proc.returncode != 0:
             return {
                 "exit_code": proc.returncode,
@@ -256,7 +261,7 @@ async def _deploy_docker(
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
-        output_parts.append("\nContainer status:\n" + stdout.decode()[:2048])
+        output_parts.append("\nContainer status:\n" + stdout.decode("utf-8", errors="replace")[:2048])
     except Exception:
         output_parts.append("\nContainer status check failed (containers may still be starting)")
 
