@@ -41,7 +41,7 @@ class ProcessDef:
     process: subprocess.Popen | None = None
 
 
-AGENT_TYPES = ["design", "dev", "validate", "deploy"]
+AGENT_TYPES = ["design", "dev", "security", "qa", "validate", "deploy"]
 
 
 def _hermes_home() -> str:

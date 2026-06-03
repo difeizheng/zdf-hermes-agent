@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from coordinator.config import load_config
+from coordinator.config import load_config, _default_workspace_dir, init_memory_if_needed
 from coordinator.db import TaskDB
 from coordinator.events import TaskEventBroadcaster
 from coordinator.kanban_sync import sync_create, sync_status, backfill_all as _kanban_backfill
@@ -42,7 +42,8 @@ async def lifespan(app: FastAPI):
     broadcaster = TaskEventBroadcaster()
     metrics = MetricsCollector()
 
-    # Backfill existing tasks to Kanban (idempotent, skips already-synced)
+    # Initialize default memories once at startup (not on every config load)
+    init_memory_if_needed(cfg.get("workspace_dir", _default_workspace_dir()))
 
     # Backfill existing tasks to Kanban (idempotent, skips already-synced)
     backfilled = _kanban_backfill()
@@ -102,12 +103,26 @@ class ResultRequest(BaseModel):
 async def create_task(task_in: TaskCreate):
     """Create a new task with optional dependencies."""
     task = _ensure_db().create_task(task_in)
-    await _ensure_broadcaster().publish(
-        TaskEvent.CREATED,
-        task_id=str(task.id),
-        task_type=task.type.value,
-        data={"title": task.title},
-    )
+    # Resolve dependency status immediately if deps already completed
+    # This handles cases where deps finished before this task was created
+    if task_in.depends_on:
+        dep_status = _ensure_db().resolve_dependencies_for_task(task.id)
+        if dep_status == "satisfied":
+            # Publish "ready" event so agents can claim immediately
+            await _ensure_broadcaster().publish(
+                TaskEvent.CREATED,
+                task_id=str(task.id),
+                task_type=task.type.value,
+                data={"title": task.title, "dependency_resolved": True},
+            )
+        task = _ensure_db().get_task(task.id)  # Refresh with resolved status
+    else:
+        await _ensure_broadcaster().publish(
+            TaskEvent.CREATED,
+            task_id=str(task.id),
+            task_type=task.type.value,
+            data={"title": task.title},
+        )
     _get_metrics().record_task_created(task.type.value)
     sync_create(str(task.id), task.type.value, task.title, task.description)
     return task
@@ -169,12 +184,31 @@ async def claim_task(task_id: str, req: ClaimRequest):
 
 
 @app.patch("/tasks/{task_id}")
-def update_task(task_id: str, update: TaskUpdate):
-    """Update task status, assignment, or dependencies."""
+async def update_task(task_id: str, update: TaskUpdate):
+    """Update task status, assignment, or dependencies.
+
+    On status changes (especially cancel), publishes SSE events, records
+    audit logs, resolves dependencies, and syncs Kanban.
+    """
     if update.depends_on is not None:
         task = _ensure_db().update_task_dependencies(task_id, update.depends_on)
     elif update.status:
         task = _ensure_db().update_task_status(task_id, update.status, update.assigned_to)
+        if task and update.status in (TaskStatus.CANCELLED,):
+            # Publish SSE event for cancellation
+            await _ensure_broadcaster().publish(
+                TaskEvent.CANCELLED,
+                task_id=str(task_id),
+                task_type=task.type.value,
+                data={"cancelled_by": update.assigned_to or "user"},
+            )
+            # Audit log
+            _ensure_db().add_event(task_id, TaskEvent.CANCELLED, {"cancelled_by": update.assigned_to or "user"})
+            # Resolve dependencies so dependents are not permanently blocked
+            _ensure_db().resolve_downstream_dependencies(task_id)
+            # Kanban sync
+            sync_status(str(task_id), "cancelled")
+            _get_metrics().record_task_failed(task.type.value, "cancelled")
     else:
         task = _ensure_db().get_task(task_id)
     if task is None:
@@ -247,7 +281,7 @@ def get_artifacts(task_id: str):
     task = _ensure_db().get_task(task_id)
     if task is None:
         raise HTTPException(404, "Task not found")
-    workspace_dir = Path(cfg.get("workspace_dir", "D:/hermes/workspace")) / str(task_id) / "artifacts"
+    workspace_dir = Path(cfg.get("workspace_dir", _default_workspace_dir())) / str(task_id) / "artifacts"
     artifacts = {}
     if workspace_dir.exists():
         for f in workspace_dir.iterdir():
@@ -256,11 +290,26 @@ def get_artifacts(task_id: str):
     return artifacts
 
 
+@app.post("/tasks/{task_id}/resolve-deps")
+def resolve_deps(task_id: str):
+    """Recompute dependency_status for a task after its deps may have changed.
+
+    Used by agent retry logic when new tasks are created AFTER their
+    dependencies have already completed. Without this call, the new task
+    stays in 'blocked' state forever.
+    """
+    task = _ensure_db().get_task(task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    new_status = _ensure_db().resolve_dependencies_for_task(task_id)
+    return {"task_id": task_id, "dependency_status": new_status}
+
+
 @app.put("/tasks/{task_id}/artifacts/{name}")
 async def upload_artifact(task_id: str, name: str, request: Request):
     """Write artifact file to disk."""
     body = await request.body()
-    workspace_dir = Path(cfg.get("workspace_dir", "D:/hermes/workspace")) / str(task_id) / "artifacts"
+    workspace_dir = Path(cfg.get("workspace_dir", _default_workspace_dir())) / str(task_id) / "artifacts"
     workspace_dir.mkdir(parents=True, exist_ok=True)
     (workspace_dir / name).write_bytes(body)
     return {"status": "ok", "path": str(workspace_dir / name)}
@@ -286,21 +335,17 @@ def metrics_endpoint():
 async def _stale_task_monitor() -> None:
     """Check for stale tasks every 30s, mark as TIMEOUT.
 
-    After marking a task TIMEOUT, calls _resolve_dependencies so that
-    any dependent tasks are not permanently blocked. This handles the
-    case where an agent process crashes (OOM, kill -9, machine power
-    loss) and the task stays in 'running' state forever without this
-    monitor triggering dependency resolution.
+    Uses TaskDB.timeout_and_resolve() which atomically finds stale tasks,
+    marks them TIMEOUT, and resolves their dependents — all under a single
+    DB lock to prevent race conditions with concurrent HTTP requests.
     """
     while True:
         await asyncio.sleep(30)
         try:
             stale_timeout = cfg["stale_timeout"] if cfg else 120
-            stale_tasks = _ensure_db().get_stale_tasks(stale_timeout)
-            for task in stale_tasks:
-                _ensure_db().update_task_status(task.id, TaskStatus.TIMEOUT)
+            timed_out = _ensure_db().timeout_and_resolve(timeout_seconds=stale_timeout)
+            for task in timed_out:
                 # Resolve dependencies so dependents are not permanently blocked
-                _ensure_db()._resolve_dependencies(str(task.id))
                 await _ensure_broadcaster().publish(
                     TaskEvent.TIMEOUT,
                     task_id=str(task.id),

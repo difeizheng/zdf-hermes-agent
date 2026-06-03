@@ -16,10 +16,20 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def _get_timeout(key: str, default: int) -> int:
+    """Load timeout value from config."""
+    try:
+        from coordinator.config import load_config
+        return int(load_config().get(key, default))
+    except Exception:
+        return default
+
+
 async def run_deploy_task(
     task_id: str,
     coordinator_url: str,
     daemon: Any = None,
+    profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Execute a deployment task.
 
@@ -30,9 +40,8 @@ async def run_deploy_task(
     Args:
         task_id: Task UUID
         coordinator_url: Base URL of the coordinator server
-        daemon: Optional AgentDaemon instance. If provided, the spawned
-                deploy subprocess (docker compose / deploy_cmd) is registered
-                with the daemon so it can be killed on cancellation/timeout.
+        daemon: Optional AgentDaemon instance for subprocess tracking.
+        profile: Optional profile configuration from profiles.py.
 
     Returns:
         Result dict with deployment URL, version, and status
@@ -96,9 +105,9 @@ async def run_deploy_task(
     commit_sha = dev_artifacts.get("commit_sha", metadata.get("commit_sha", ""))
 
     # Use worktree from dev task if available, otherwise create one
-    from coordinator.config import load_config
+    from coordinator.config import load_config, _default_workspace_dir
     cfg = load_config()
-    workspace_dir = Path(cfg.get("workspace_dir", "D:/hermes/workspace")) / str(task_id) / "worktree"
+    workspace_dir = Path(cfg.get("workspace_dir", _default_workspace_dir())) / str(task_id) / "worktree"
 
     if commit_sha:
         existing_worktree = dev_metadata.get("worktree", "")
@@ -162,7 +171,7 @@ async def _run_deploy(
         )
         if daemon is not None and task_id is not None:
             daemon.register_subprocess(task_id, proc)
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=3600)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_get_timeout("deploy_timeout", 3600))
         return {
             "exit_code": proc.returncode,
             "output": stdout.decode()[:4096],
@@ -224,7 +233,7 @@ async def _deploy_docker(
         )
         if daemon is not None and task_id is not None:
             daemon.register_subprocess(task_id, proc)
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_get_timeout("test_timeout", 600))
         output_parts.append(stdout.decode()[:2048])
         if stderr:
             output_parts.append("STDERR: " + stderr.decode()[:2048])

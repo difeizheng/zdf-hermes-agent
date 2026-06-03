@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from coordinator.config import load_config
+from coordinator.config import load_config, _default_workspace_dir
 
 
 def _progress_log_path(task_id: str) -> Path:
@@ -25,7 +25,7 @@ def _progress_log_path(task_id: str) -> Path:
     Creates the parent directory if needed.
     """
     cfg = load_config()
-    workspace = Path(cfg.get("workspace_dir", "D:/hermes/workspace")) / str(task_id)
+    workspace = Path(cfg.get("workspace_dir", _default_workspace_dir())) / str(task_id)
     workspace.mkdir(parents=True, exist_ok=True)
     return workspace / "progress.log"
 

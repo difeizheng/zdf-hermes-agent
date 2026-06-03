@@ -12,6 +12,8 @@ from pydantic import BaseModel, Field
 class TaskType(str, Enum):
     DESIGN = "design"
     DEV = "dev"
+    SECURITY = "security"
+    QA = "qa"
     VALIDATE = "validate"
     DEPLOY = "deploy"
 

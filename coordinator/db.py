@@ -194,11 +194,12 @@ class TaskDB:
     def claim_task(self, task_id: int | str, agent_id: str) -> Optional[Task]:
         """Atomic CAS: pending → running with assigned_to. Only if all deps completed."""
         with self._lock:
-            # Verify all dependencies are completed
+            # Verify all dependencies are in terminal state (completed/cancelled/timeout/failed)
+            # Note: failed/cancelled/timeout also unblock dependents (per resolve_dependencies_for_task)
             cur = self._conn.execute(
                 "SELECT COUNT(*) FROM task_dependencies td "
                 "LEFT JOIN tasks t ON t.id = td.depends_on "
-                "WHERE td.task_id = ? AND (t.status IS NULL OR t.status != 'completed')",
+                "WHERE td.task_id = ? AND (t.status IS NULL OR t.status NOT IN ('completed', 'cancelled', 'timeout', 'failed'))",
                 (task_id,),
             )
             incomplete = cur.fetchone()[0]
@@ -241,8 +242,11 @@ class TaskDB:
             )
             self._conn.commit()
             task = self.get_task(task_id)
-            if task and not error:
-                self._resolve_dependencies(task_id)
+            if task:
+                # Always resolve dependencies on task completion or failure.
+                # Terminal states (completed/failed) unblock downstream tasks
+                # so the pipeline doesn't stall when Security/QA/Dev fail.
+                self._resolve_dependencies_unlocked(task_id)
             return task
 
     def list_tasks(
@@ -284,13 +288,47 @@ class TaskDB:
             )
             self._conn.commit()
 
-    def _resolve_dependencies(self, completed_task_id: int | str) -> None:
+    def timeout_and_resolve(self, timeout_seconds: int = 120) -> list[Task]:
+        """Mark stale running tasks as TIMEOUT and resolve their dependents.
+
+        Thread-safe wrapper that acquires the DB lock, finds stale tasks,
+        updates their status, and resolves dependencies so dependents are
+        not permanently blocked. Returns the list of tasks that were timed out.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM tasks WHERE status = 'running' "
+                "AND last_heartbeat_at IS NOT NULL "
+                "AND (julianday('now') - julianday(last_heartbeat_at)) * 86400 > ?",
+                (timeout_seconds,),
+            ).fetchall()
+            timed_out: list[Task] = []
+            for row in rows:
+                self._conn.execute(
+                    "UPDATE tasks SET status = ? WHERE id = ?",
+                    (TaskStatus.TIMEOUT.value, row["id"]),
+                )
+                self._resolve_dependencies_unlocked(row["id"])
+                # Fetch deps for the timed-out task
+                deps = [
+                    d[0] for d in self._conn.execute(
+                        "SELECT depends_on FROM task_dependencies WHERE task_id = ?",
+                        (row["id"],),
+                    ).fetchall()
+                ]
+                timed_out.append(self._row_to_task(row, deps))
+            self._conn.commit()
+            return timed_out
+
+    def _resolve_dependencies_unlocked(self, completed_task_id: int | str) -> None:
         """When a task completes or enters a terminal state, check if blocked tasks become satisfied.
 
         Terminal states: completed, cancelled, timeout, failed.
         This ensures that when an agent crashes (→ timeout), its dependents
         are not permanently blocked. The downstream agent's own retry logic
         will handle the missing work.
+
+        IMPORTANT: Caller MUST hold self._lock before calling this method.
         """
         import logging
         logger = logging.getLogger(__name__)
@@ -319,6 +357,16 @@ class TaskDB:
             else:
                 logger.info("Task %s still has unsatisfied dependencies", dependent_id)
         self._conn.commit()
+
+    def resolve_downstream_dependencies(self, completed_task_id: int | str) -> None:
+        """Public, thread-safe wrapper: resolve dependents of a completed/cancelled task.
+
+        Used by the server's PATCH endpoint when a task is cancelled, and by
+        any other code path that needs to unblock downstream tasks without
+        going through submit_result.
+        """
+        with self._lock:
+            self._resolve_dependencies_unlocked(completed_task_id)
 
     def resolve_dependencies_for_task(self, task_id: int | str) -> str:
         """Recompute dependency_status for a specific task based on its deps' states.

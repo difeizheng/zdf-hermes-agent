@@ -28,8 +28,8 @@ async def main() -> None:
     from coordinator.agent_daemon import AgentDaemon
 
     class DesignDaemon(AgentDaemon):
-        async def execute_task(self, task_id):
-            return await run_design_task(task_id, self.coordinator_url)
+        async def execute_task(self, task_id, *, profile=None):
+            return await run_design_task(task_id, self.coordinator_url, profile=profile)
 
     daemon = DesignDaemon(
         agent_type="design",

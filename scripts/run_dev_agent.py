@@ -28,8 +28,8 @@ async def main() -> None:
     from coordinator.agent_daemon import AgentDaemon
 
     class DevDaemon(AgentDaemon):
-        async def execute_task(self, task_id):
-            return await run_dev_task(task_id, self.coordinator_url, daemon=self)
+        async def execute_task(self, task_id, *, profile=None):
+            return await run_dev_task(task_id, self.coordinator_url, daemon=self, profile=profile)
 
     daemon = DevDaemon(
         agent_type="dev",

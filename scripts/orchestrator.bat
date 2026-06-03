@@ -49,7 +49,7 @@ echo.
 echo Usage: orchestrator [command]
 echo.
 echo Commands:
-echo   start       Start coordinator + 4 agents (background)
+echo   start       Start coordinator + 6 agents (background)
 echo   stop        Stop all processes
 echo   status      Show process status
 echo   logs [-f]   View coordinator log (-f to follow)

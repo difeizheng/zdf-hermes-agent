@@ -11,6 +11,16 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+# Map task types to profile names
+_TASK_TYPE_TO_PROFILE = {
+    "design": "architect",
+    "dev": "tdd-developer",
+    "security": "security-auditor",
+    "qa": "qa-engineer",
+    "validate": "qa-engineer",
+    "deploy": "tdd-developer",
+}
+
 
 class AgentDaemon:
     """Long-lived daemon that claims and executes tasks via SSE subscription."""
@@ -28,6 +38,19 @@ class AgentDaemon:
         self.heartbeat_interval = heartbeat_interval
         self._running = False
         self._active_processes: dict[str, asyncio.subprocess.Process] = {}
+        self.profile = self._load_profile()
+
+    def _load_profile(self) -> dict[str, Any] | None:
+        """Load profile configuration for this agent's task type."""
+        profile_name = _TASK_TYPE_TO_PROFILE.get(self.agent_type)
+        if not profile_name:
+            return None
+        try:
+            from coordinator.config import get_profile_config
+            return get_profile_config(profile_name)
+        except Exception as e:
+            logger.warning("Failed to load profile '%s': %s", profile_name, e)
+            return None
 
     async def run(self) -> None:
         """Main daemon loop."""
@@ -122,7 +145,7 @@ class AgentDaemon:
                 watcher = asyncio.create_task(self._watch_cancellation(task_id))
 
                 try:
-                    result = await self.execute_task(task_id)
+                    result = await self.execute_task(task_id, profile=self.profile)
                 finally:
                     # Stop the watcher regardless of outcome
                     watcher.cancel()
@@ -217,6 +240,9 @@ class AgentDaemon:
                 },
             )
 
+        # Auto-write memory entries from agent result (if any)
+        self._write_memories_from_result(result)
+
     async def _submit_error(self, task_id: str, error: str) -> None:
         async with httpx.AsyncClient(timeout=30.0) as client:
             await client.post(
@@ -224,8 +250,52 @@ class AgentDaemon:
                 json={"error": error},
             )
 
-    async def execute_task(self, task_id: str) -> dict[str, Any]:
-        """Override in subclass."""
+    def _write_memories_from_result(self, result: dict[str, Any]) -> None:
+        """Extract memory entries from agent result and write to workspace memory.
+
+        Agents can include a 'memory_updates' list in their result dict:
+        [
+            {"category": "errors", "name": "slug", "content": "..."},
+            {"category": "patterns", "name": "slug", "content": "..."},
+        ]
+        """
+        memory_updates = result.get("memory_updates")
+        if not memory_updates or not isinstance(memory_updates, list):
+            return
+
+        try:
+            from coordinator.config import load_config, _default_workspace_dir
+            from coordinator.memory import MemorySystem, MemoryEntry
+            from pathlib import Path
+            from datetime import datetime
+
+            cfg = load_config()
+            workspace_dir = Path(cfg.get("workspace_dir", _default_workspace_dir()))
+            memory = MemorySystem(workspace_dir)
+
+            written = 0
+            for entry in memory_updates:
+                cat = entry.get("category", "errors")
+                name = entry.get("name", "")
+                content = entry.get("content", "")
+                if name and content:
+                    me = MemoryEntry(
+                        category=cat,
+                        name=name,
+                        content=content,
+                        created_at=datetime.now(),
+                        metadata=entry.get("metadata"),
+                    )
+                    memory.write(me)
+                    written += 1
+
+            if written:
+                logger.info("Auto-wrote %d memory entries from %s task", written, self.agent_type)
+        except Exception as e:
+            logger.warning("Failed to write memories from result: %s", e)
+
+    async def execute_task(self, task_id: str, *, profile: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Override in subclass. Receives profile config for the agent's task type."""
         raise NotImplementedError
 
     async def _recover_pending_tasks(self) -> None:

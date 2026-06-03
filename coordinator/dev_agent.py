@@ -18,6 +18,15 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def _get_timeout(key: str, default: int) -> int:
+    """Load timeout value from config."""
+    try:
+        from coordinator.config import load_config
+        return int(load_config().get(key, default))
+    except Exception:
+        return default
+
+
 def _get_local_docker_images() -> list[str]:
     """Get list of locally available Docker image names (e.g., 'python:3.12-slim')."""
     try:
@@ -38,15 +47,15 @@ async def run_dev_task(
     task_id: str,
     coordinator_url: str,
     daemon: Any = None,
+    profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Execute a dev task via Claude Code CLI.
 
     Args:
         task_id: Task UUID
         coordinator_url: Base URL of the coordinator server
-        daemon: Optional AgentDaemon instance. If provided, the spawned
-                Claude Code subprocess is registered with the daemon so it
-                can be killed on task cancellation/timeout.
+        daemon: Optional AgentDaemon instance for subprocess tracking.
+        profile: Optional profile configuration from profiles.py.
 
     Returns:
         Result dict with commit SHA, changed files, test results
@@ -74,37 +83,50 @@ async def run_dev_task(
         task_data.get("depends_on", []), coordinator_url
     )
 
+    # Load memory context from previous phases (errors to avoid, patterns to follow)
+    memory_context = ""
+    try:
+        from coordinator.config import load_config, _default_workspace_dir
+        _cfg = load_config()
+        _workspace = Path(_cfg.get("workspace_dir", _default_workspace_dir()))
+        from coordinator.memory import load_memory_context
+        memory_context = load_memory_context(_workspace, categories=["errors", "patterns"])
+    except Exception as e:
+        logger.warning("Failed to load memory context: %s", e)
+
     # Check if this is a retry task - if so, try to reuse the original dev's worktree
     is_retry = metadata.get("is_retry", False)
     original_dev_id = metadata.get("original_dev_id", "")
     existing_worktree = ""
+    original_dev: dict[str, Any] = {}
     if is_retry and original_dev_id:
         try:
-            resp = await client.get(f"{coordinator_url}/tasks/{original_dev_id}")
-            resp.raise_for_status()
-            original_dev = resp.json()
+            async with httpx.AsyncClient(timeout=30.0) as retry_client:
+                resp = await retry_client.get(f"{coordinator_url}/tasks/{original_dev_id}")
+                resp.raise_for_status()
+                original_dev = resp.json()
             existing_worktree = original_dev.get("metadata", {}).get("worktree", "")
             if existing_worktree and Path(existing_worktree).exists():
                 logger.info("Reusing worktree from original dev %s: %s", original_dev_id[:8], existing_worktree)
         except Exception as e:
             logger.warning("Failed to fetch original dev worktree: %s", e)
 
-    # Build prompt
-    prompt = _build_dev_prompt(description, design_artifacts)
+    # Build prompt — inject profile behavior if available
+    prompt = _build_dev_prompt(description, design_artifacts, profile=profile, memory_context=memory_context)
     write_progress(task_id, f"Loaded {len(design_artifacts)} design artifact(s)")
 
     # Determine project directory
     repo_path = metadata.get("git_repo")
 
     # Create workspace directory
-    from coordinator.config import load_config
+    from coordinator.config import load_config, _default_workspace_dir
     cfg = load_config()
-    workspace_dir = Path(cfg.get("workspace_dir", "D:/hermes/workspace")) / str(task_id) / "worktree"
+    workspace_dir = Path(cfg.get("workspace_dir", _default_workspace_dir())) / str(task_id) / "worktree"
 
     # For retry tasks, reuse existing worktree if available
     if existing_worktree:
         workspace_dir = Path(existing_worktree)
-        branch = original_dev.get("artifacts", {}).get("branch", "main")
+        branch = original_dev.get("artifacts", {}).get("branch", "main") if original_dev else "main"
         logger.info("Reusing existing worktree: %s", workspace_dir)
     else:
         workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -189,7 +211,12 @@ async def _fetch_dependency_artifacts(dep_ids: list[str], coordinator_url: str) 
     return artifacts
 
 
-def _build_dev_prompt(description: str, design_artifacts: dict[str, str]) -> str:
+def _build_dev_prompt(
+    description: str,
+    design_artifacts: dict[str, str],
+    profile: dict[str, Any] | None = None,
+    memory_context: str = "",
+) -> str:
     """Build the prompt for Claude Code."""
     local_images = _get_local_docker_images()
     image_hint = ""
@@ -202,10 +229,29 @@ def _build_dev_prompt(description: str, design_artifacts: dict[str, str]) -> str
     parts = [
         f"Task: {description}",
         "",
-        "Design documents from the design phase:",
     ]
-    for name, content in design_artifacts.items():
-        parts.append(f"\n--- {name} ---\n{content}")
+
+    # Inject profile behavior as role guidance
+    if profile:
+        parts.append("## Agent Profile")
+        parts.append("")
+        if profile.get("behavior"):
+            parts.append(f"Behavior: {profile['behavior']}")
+        if profile.get("rules"):
+            parts.append(f"Rules enforced: {', '.join(profile['rules'])}")
+        if profile.get("output"):
+            parts.append(f"Expected output: {profile['output']}")
+        parts.append("")
+
+    # Inject memory context (errors to avoid, patterns from past projects)
+    if memory_context:
+        parts.append(memory_context)
+        parts.append("")
+
+    if design_artifacts:
+        parts.append("Design documents from the design phase:")
+        for name, content in design_artifacts.items():
+            parts.append(f"\n--- {name} ---\n{content}")
     if image_hint:
         parts.append(image_hint)
     parts.extend([
@@ -217,13 +263,13 @@ def _build_dev_prompt(description: str, design_artifacts: dict[str, str]) -> str
         parts.append("2. Write tests for new functionality")
         parts.append("3. Commit changes with a clear commit message")
         parts.append("4. Do not modify unrelated files")
-        parts.append("5. Generate a Dockerfile for the project (multi-stage build, production-ready). CRITICAL: You MUST use a locally cached Docker image that is already on this machine. Check 'docker images' output and pick an image from the AVAILABLE IMAGES list above. For Python projects, use 'python:3.12-slim' (NOT 'python:3.11-slim' or any other version). For Node projects, use 'node:20-alpine'. NEVER pull a new image from the internet - only use images confirmed by 'docker images'.")
+        parts.append("5. Generate a Dockerfile for the project (multi-stage build, production-ready). CRITICAL: You MUST use a locally cached Docker image that is already on this machine. Check 'docker images' output and pick an image from the AVAILABLE IMAGES list above. NEVER pull a new image from the internet - only use images confirmed by 'docker images'.")
         parts.append("6. Generate a docker-compose.yml for local development (app + database + any dependencies)")
     else:
         parts.append("1. Create a clean project structure for this feature")
         parts.append("2. Write tests for all functionality")
         parts.append("3. Commit changes with clear commit messages")
-        parts.append("4. Generate a Dockerfile (multi-stage build, production-ready). CRITICAL: You MUST use a locally cached Docker image that is already on this machine. Check 'docker images' output and pick an image from the AVAILABLE IMAGES list above. For Python projects, use 'python:3.12-slim' (NOT 'python:3.11-slim' or any other version). NEVER pull a new image from the internet - only use images confirmed by 'docker images'.")
+        parts.append("4. Generate a Dockerfile (multi-stage build, production-ready). CRITICAL: You MUST use a locally cached Docker image that is already on this machine. Check 'docker images' output and pick an image from the AVAILABLE IMAGES list above. NEVER pull a new image from the internet - only use images confirmed by 'docker images'.")
         parts.append("5. Generate a docker-compose.yml for local development")
     return "\n".join(parts)
 
@@ -315,7 +361,7 @@ async def _run_claude_code(
             )
         else:
             proc = await asyncio.create_subprocess_exec(
-                "claude", "-p", prompt,
+                "claude", "-p", prompt, "--dangerously-skip-permissions",
                 cwd=str(worktree_dir),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -325,7 +371,7 @@ async def _run_claude_code(
         if daemon is not None and task_id is not None:
             daemon.register_subprocess(task_id, proc)
 
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=1800)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_get_timeout("claude_code_timeout", 1800))
         return {
             "stdout": stdout.decode()[:4096],
             "stderr": stderr.decode()[:4096],
@@ -376,7 +422,7 @@ async def _run_tests(worktree_dir: Path, test_cmd: str) -> dict[str, Any]:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_get_timeout("test_timeout", 600))
         return {
             "exit_code": proc.returncode,
             "output": stdout.decode()[:4096],
