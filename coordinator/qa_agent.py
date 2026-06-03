@@ -8,29 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import subprocess
 from pathlib import Path
 from typing import Any
 
+from coordinator.shared_heartbeat import start_heartbeat
+from coordinator.shared_helpers import get_timeout, get_min_coverage, get_workspace_dir
+
 logger = logging.getLogger(__name__)
-
-
-def _get_min_coverage() -> float:
-    """Load minimum coverage threshold from config."""
-    try:
-        from coordinator.config import load_config
-        return float(load_config().get("min_coverage", 80.0))
-    except Exception:
-        return 80.0
-
-
-def _get_timeout(key: str, default: int) -> int:
-    """Load timeout value from config."""
-    try:
-        from coordinator.config import load_config
-        return int(load_config().get(key, default))
-    except Exception:
-        return default
 
 
 async def run_qa_task(
@@ -39,17 +23,7 @@ async def run_qa_task(
     daemon: Any = None,
     profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Execute a QA task.
-
-    Args:
-        task_id: Task UUID
-        coordinator_url: Base URL of the coordinator server
-        daemon: Optional AgentDaemon instance for subprocess tracking.
-        profile: Optional profile configuration from profiles.py.
-
-    Returns:
-        Result dict with test results and coverage report
-    """
+    """Execute a QA task."""
     import httpx
 
     # Fetch task details
@@ -62,13 +36,33 @@ async def run_qa_task(
     if not dep_ids:
         return {"error": "No dev task dependency found"}
 
-    # Start heartbeat background task
-    heartbeat_task = asyncio.create_task(_send_heartbeat(task_id, coordinator_url))
+    # Start heartbeat with try/finally safety
+    hb = start_heartbeat(task_id, coordinator_url)
 
-    # Stream progress notes
+    try:
+        return await _execute_qa(
+            task_id, coordinator_url, task_data, daemon=daemon, profile=profile,
+        )
+    finally:
+        await hb.cancel_and_wait()
+
+
+async def _execute_qa(
+    task_id: str,
+    coordinator_url: str,
+    task_data: dict[str, Any],
+    daemon: Any = None,
+    profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Core QA execution, called inside heartbeat try/finally."""
+    import httpx
     from coordinator.progress import write_progress
+
     write_progress(task_id, f"QA task started: {task_data.get('title', '')[:60]}")
 
+    dep_ids = task_data.get("depends_on", [])
+    if not dep_ids:
+        return {"error": "No dev task dependency found"}
     dev_task_id = dep_ids[0]
 
     # Fetch dev task for worktree path
@@ -81,11 +75,6 @@ async def run_qa_task(
     dev_worktree = dev_metadata.get("worktree")
 
     if not dev_worktree or not Path(dev_worktree).exists():
-        heartbeat_task.cancel()
-        try:
-            await heartbeat_task
-        except asyncio.CancelledError:
-            pass
         raise RuntimeError(f"Dev worktree not found: {dev_worktree}")
 
     # Detect project type and run appropriate tests
@@ -106,17 +95,10 @@ async def run_qa_task(
     # Parse results
     test_passed = test_results.get("exit_code", 1) == 0
     coverage_pct = coverage_results.get("coverage", 0.0)
-    coverage_passed = coverage_pct >= _get_min_coverage()
+    coverage_passed = coverage_pct >= get_min_coverage()
 
     # Write QA artifact
-    from coordinator.config import load_config, _default_workspace_dir
-
-    cfg = load_config()
-    artifact_dir = (
-        Path(cfg.get("workspace_dir", _default_workspace_dir()))
-        / str(task_id)
-        / "artifacts"
-    )
+    artifact_dir = Path(get_workspace_dir()) / str(task_id) / "artifacts"
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
     qa_report = _build_qa_report(
@@ -149,34 +131,14 @@ async def run_qa_task(
         if not test_passed:
             return_result["error"] = f"tests_failed: exit_code={test_results.get('exit_code', -1)}"
         else:
-            return_result["error"] = f"coverage_insufficient: {coverage_pct}% < {_get_min_coverage()}%"
+            return_result["error"] = f"coverage_insufficient: {coverage_pct}% < {get_min_coverage()}%"
 
     # Auto-write QA learnings to memory
     memory_updates = _extract_qa_memories(test_passed, coverage_pct, project_type)
     if memory_updates:
         return_result["memory_updates"] = memory_updates
 
-    # Cancel heartbeat task
-    heartbeat_task.cancel()
-    try:
-        await heartbeat_task
-    except asyncio.CancelledError:
-        pass
-
     return return_result
-
-
-async def _send_heartbeat(task_id: str, coordinator_url: str) -> None:
-    """Send periodic heartbeats to prevent task timeout."""
-    import httpx
-    while True:
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                await client.post(f"{coordinator_url}/tasks/{task_id}/heartbeat")
-                logger.debug("Sent heartbeat for task %s", task_id[:8])
-        except Exception as e:
-            logger.warning("Failed to send heartbeat for task %s: %s", task_id[:8], e)
-        await asyncio.sleep(30)
 
 
 def _detect_project_type(worktree_dir: str) -> str:
@@ -242,11 +204,9 @@ async def _run_tests_with_coverage(
         if daemon is not None and task_id is not None:
             daemon.register_subprocess(task_id, proc)
 
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_get_timeout("test_timeout", 600))
-        output = stdout.decode()
-        error_output = stderr.decode()
-
-        # Parse coverage from combined output
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=get_timeout("test_timeout", 600))
+        output = stdout.decode("utf-8", errors="replace")
+        error_output = stderr.decode("utf-8", errors="replace")
         coverage = 0.0
         match = re.search(r"TOTAL\s+\d+\s+\d+\s+(\d+)%", output)
         if match:
@@ -274,7 +234,7 @@ async def _run_tests_with_coverage(
         except Exception:
             pass
         return {
-            "test": {"exit_code": -1, "error": "Tests timed out after 10 minutes"},
+            "test": {"exit_code": -1, "error": f"Tests timed out after {get_timeout('test_timeout', 600) // 60} minutes"},
             "coverage": {"coverage": 0.0, "error": "Tests timed out"},
         }
     except Exception as e:
@@ -323,20 +283,21 @@ async def _run_tests(
         if daemon is not None and task_id is not None:
             daemon.register_subprocess(task_id, proc)
 
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_get_timeout("test_timeout", 600))
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=get_timeout("test_timeout", 600))
         return {
             "exit_code": proc.returncode,
-            "output": stdout.decode()[:4096],
-            "error": stderr.decode()[:2048],
+            "output": stdout.decode("utf-8", errors="replace")[:4096],
+            "error": stderr.decode("utf-8", errors="replace")[:2048],
         }
     except FileNotFoundError:
         return {"exit_code": -1, "error": f"Test runner not found for {project_type}"}
     except asyncio.TimeoutError:
         try:
             proc.kill()
+            await proc.wait()
         except Exception:
             pass
-        return {"exit_code": -1, "error": "Tests timed out after 10 minutes"}
+        return {"exit_code": -1, "error": f"Tests timed out after {get_timeout('test_timeout', 600) // 60} minutes"}
     except Exception as e:
         return {"exit_code": -1, "error": str(e)}
 
@@ -352,8 +313,8 @@ async def _run_coverage(worktree_dir: str, project_type: str) -> dict[str, Any]:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_get_timeout("coverage_timeout", 300))
-            output = stdout.decode()
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=get_timeout("coverage_timeout", 300))
+            output = stdout.decode("utf-8", errors="replace")
 
             # Parse coverage percentage from pytest-cov output
             import re
@@ -376,8 +337,8 @@ async def _run_coverage(worktree_dir: str, project_type: str) -> dict[str, Any]:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_get_timeout("coverage_timeout", 300))
-            output = stdout.decode()
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=get_timeout("coverage_timeout", 300))
+            output = stdout.decode("utf-8", errors="replace")
 
             # Parse coverage from vitest/jest output
             import re
@@ -398,11 +359,11 @@ async def _run_coverage(worktree_dir: str, project_type: str) -> dict[str, Any]:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_get_timeout("coverage_timeout", 300))
-            output = stdout.decode()
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=get_timeout("coverage_timeout", 300))
+            output = stdout.decode("utf-8", errors="replace")
 
             import re
-            match = re.search(r"(\d+\.?\d)% coverage", output)
+            match = re.search(r"(\d+\.?\d*)% coverage", output)
             if match:
                 coverage = float(match.group(1))
             else:
@@ -418,8 +379,8 @@ async def _run_coverage(worktree_dir: str, project_type: str) -> dict[str, Any]:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_get_timeout("coverage_timeout", 300))
-            output = stdout.decode()
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=get_timeout("coverage_timeout", 300))
+            output = stdout.decode("utf-8", errors="replace")
 
             # Parse Go coverage
             import re
@@ -467,7 +428,7 @@ def _build_qa_report(
         "## Coverage Results",
         "",
         f"- Coverage: {coverage_results.get('coverage', 0.0):.1f}% ({'PASS' if coverage_passed else 'FAIL'})",
-        f"- Threshold: {_get_min_coverage()}%",
+        f"- Threshold: {get_min_coverage()}%",
         "",
         "### Coverage Output",
         "",
@@ -499,7 +460,7 @@ def _extract_qa_memories(
     """
     updates: list[dict[str, str]] = []
 
-    if test_passed and coverage_pct >= _get_min_coverage():
+    if test_passed and coverage_pct >= get_min_coverage():
         # Success pattern — what worked
         updates.append({
             "category": "patterns",
@@ -507,7 +468,7 @@ def _extract_qa_memories(
             "content": (
                 f"QA passed for {project_type} project. Coverage: {coverage_pct:.1f}%. "
                 f"Testing strategy: run pytest with --cov for Python, npm test for Node.js. "
-                f"Threshold: {_get_min_coverage()}% coverage, all tests passing."
+                f"Threshold: {get_min_coverage()}% coverage, all tests passing."
             ),
         })
     elif not test_passed:
@@ -520,12 +481,12 @@ def _extract_qa_memories(
                 f"Run tests locally before pushing to catch failures early."
             ),
         })
-    elif coverage_pct < _get_min_coverage():
+    elif coverage_pct < get_min_coverage():
         updates.append({
             "category": "errors",
             "name": f"qa-coverage-low-{project_type}-{int(coverage_pct)}pct",
             "content": (
-                f"Coverage {coverage_pct:.1f}% below threshold {_get_min_coverage()}% for {project_type}. "
+                f"Coverage {coverage_pct:.1f}% below threshold {get_min_coverage()}% for {project_type}. "
                 f"Add unit tests for all new functions and edge cases. "
                 f"Focus on uncovered branches and error handling paths."
             ),

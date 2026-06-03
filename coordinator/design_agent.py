@@ -6,6 +6,7 @@ Can run as a daemon (SSE subscription) or be called directly.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -15,14 +16,10 @@ import httpx
 
 from coordinator.config import load_config as load_coordinator_config
 from coordinator.config import load_llm_config as _load_llm_config
+from coordinator.shared_heartbeat import start_heartbeat
+from coordinator.shared_helpers import get_workspace_dir
 
 logger = logging.getLogger(__name__)
-
-
-def _get_workspace_dir(cfg: dict) -> Path:
-    """Return workspace_dir from config, falling back to platform-aware default."""
-    from coordinator.config import _default_workspace_dir
-    return Path(cfg.get("workspace_dir") or _default_workspace_dir())
 
 
 async def run_design_task(
@@ -52,13 +49,29 @@ async def run_design_task(
     title = task_data["title"]
 
     # Start heartbeat to prevent timeout during long Claude API calls
-    import asyncio
-    heartbeat_task = asyncio.create_task(_send_heartbeat(task_id, coordinator_url))
+    hb = start_heartbeat(task_id, coordinator_url)
 
+    try:
+        return await _execute_design(
+            task_id, coordinator_url, cfg, description, title, profile,
+        )
+    finally:
+        await hb.cancel_and_wait()
+
+
+async def _execute_design(
+    task_id: str,
+    coordinator_url: str,
+    cfg: dict[str, Any],
+    description: str,
+    title: str,
+    profile: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Core design execution, called inside heartbeat try/finally."""
     # Load memory context (decisions + errors from past projects)
     memory_context = ""
     try:
-        workspace_dir = _get_workspace_dir(cfg)
+        workspace_dir = Path(get_workspace_dir(cfg))
         from coordinator.memory import load_memory_context
         memory_context = load_memory_context(workspace_dir, categories=["errors", "decisions"])
     except Exception as e:
@@ -103,36 +116,16 @@ async def run_design_task(
     actual_model = llm.get("model", "claude-opus-4-8")
 
     # Write artifacts to disk under configured workspace_dir
-    workspace_dir = _get_workspace_dir(cfg) / str(task_id) / "artifacts"
+    workspace_dir = Path(get_workspace_dir(cfg)) / str(task_id) / "artifacts"
     workspace_dir.mkdir(parents=True, exist_ok=True)
 
     for name, content in artifacts.items():
         (workspace_dir / name).write_text(content, encoding="utf-8")
 
-    # Cancel heartbeat
-    heartbeat_task.cancel()
-    try:
-        await heartbeat_task
-    except asyncio.CancelledError:
-        pass
-
     return {
         "artifacts": {name: str(workspace_dir / name) for name in artifacts},
         "metadata": {"model": actual_model, "title": title},
     }
-
-
-async def _send_heartbeat(task_id: str, coordinator_url: str) -> None:
-    """Send periodic heartbeats to prevent task timeout during long API calls."""
-    import asyncio
-    while True:
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                await client.post(f"{coordinator_url}/tasks/{task_id}/heartbeat")
-                logger.debug("Sent heartbeat for design task %s", task_id[:8])
-        except Exception as e:
-            logger.warning("Failed to send heartbeat for task %s: %s", task_id[:8], e)
-        await asyncio.sleep(30)
 
 
 async def _call_claude_api(

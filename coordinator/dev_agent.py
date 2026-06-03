@@ -15,16 +15,11 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from coordinator.shared_heartbeat import start_heartbeat
+from coordinator.shared_claude_cli import run_claude_cli
+from coordinator.shared_helpers import get_timeout, get_workspace_dir
+
 logger = logging.getLogger(__name__)
-
-
-def _get_timeout(key: str, default: int) -> int:
-    """Load timeout value from config."""
-    try:
-        from coordinator.config import load_config
-        return int(load_config().get(key, default))
-    except Exception:
-        return default
 
 
 def _get_local_docker_images() -> list[str]:
@@ -72,10 +67,27 @@ async def run_dev_task(
     metadata = task_data.get("metadata", {})
 
     # Start heartbeat background task to prevent timeout during long operations
-    heartbeat_task = asyncio.create_task(_send_heartbeat(task_id, coordinator_url))
+    hb = start_heartbeat(task_id, coordinator_url)
+
+    try:
+        return await _execute_dev(
+            task_id, coordinator_url, task_data, daemon=daemon, profile=profile,
+        )
+    finally:
+        await hb.cancel_and_wait()
+
+
+async def _execute_dev(
+    task_id: str,
+    coordinator_url: str,
+    task_data: dict[str, Any],
+    daemon: Any = None,
+    profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Core dev execution, called inside heartbeat try/finally."""
+    from coordinator.progress import write_progress
 
     # Stream progress notes for the user
-    from coordinator.progress import write_progress
     write_progress(task_id, f"Dev task started: {task_data.get('title', '')[:60]}")
 
     # Fetch dependency artifacts (design docs)
@@ -95,6 +107,8 @@ async def run_dev_task(
         logger.warning("Failed to load memory context: %s", e)
 
     # Check if this is a retry task - if so, try to reuse the original dev's worktree
+    metadata = task_data.get("metadata", {})
+    description = task_data["description"]
     is_retry = metadata.get("is_retry", False)
     original_dev_id = metadata.get("original_dev_id", "")
     existing_worktree = ""
@@ -119,9 +133,7 @@ async def run_dev_task(
     repo_path = metadata.get("git_repo")
 
     # Create workspace directory
-    from coordinator.config import load_config, _default_workspace_dir
-    cfg = load_config()
-    workspace_dir = Path(cfg.get("workspace_dir", _default_workspace_dir())) / str(task_id) / "worktree"
+    workspace_dir = Path(get_workspace_dir()) / str(task_id) / "worktree"
 
     # For retry tasks, reuse existing worktree if available
     if existing_worktree:
@@ -144,7 +156,7 @@ async def run_dev_task(
     # Run Claude Code
     logger.info("Invoking claude code in %s", workspace_dir)
     write_progress(task_id, f"Invoking Claude Code in {workspace_dir.name}...")
-    result = await _run_claude_code(
+    result = await run_claude_cli(
         workspace_dir, prompt,
         daemon=daemon, task_id=task_id,
     )
@@ -164,13 +176,6 @@ async def run_dev_task(
     if test_cmd and shutil.which(test_cmd.split()[0]):
         test_results = await _run_tests(workspace_dir, test_cmd)
 
-    # Cancel heartbeat task
-    heartbeat_task.cancel()
-    try:
-        await heartbeat_task
-    except asyncio.CancelledError:
-        pass
-
     return {
         "artifacts": {
             "commit_sha": commit_sha,
@@ -180,19 +185,6 @@ async def run_dev_task(
         },
         "metadata": {"worktree": str(workspace_dir)},
     }
-
-
-async def _send_heartbeat(task_id: str, coordinator_url: str) -> None:
-    """Send periodic heartbeats to prevent task timeout during long operations."""
-    import httpx
-    while True:
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                await client.post(f"{coordinator_url}/tasks/{task_id}/heartbeat")
-                logger.debug("Sent heartbeat for task %s", task_id[:8])
-        except Exception as e:
-            logger.warning("Failed to send heartbeat for task %s: %s", task_id[:8], e)
-        await asyncio.sleep(30)  # Send heartbeat every 30 seconds
 
 
 async def _fetch_dependency_artifacts(dep_ids: list[str], coordinator_url: str) -> dict[str, str]:
@@ -275,157 +267,109 @@ def _build_dev_prompt(
 
 
 async def _init_fresh_repo(worktree_dir: Path) -> None:
-    """Initialize a fresh empty git repo for the task."""
-    subprocess.run(
-        ["git", "-C", str(worktree_dir), "init", "-b", "main"],
-        capture_output=True, text=True, timeout=10, check=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(worktree_dir), "config", "user.email", "hermes-agent@local"],
-        capture_output=True, text=True, timeout=5,
-    )
-    subprocess.run(
-        ["git", "-C", str(worktree_dir), "config", "user.name", "Hermes Agent"],
-        capture_output=True, text=True, timeout=5,
-    )
-    # Initial empty commit
-    subprocess.run(
-        ["git", "-C", str(worktree_dir), "commit", "--allow-empty", "-m", "Initial commit"],
-        capture_output=True, text=True, timeout=10,
-    )
+    """Initialize a fresh empty git repo for the task (non-blocking)."""
+    async def _git(*args: str) -> None:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "-C", str(worktree_dir), *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=30)
+
+    await _git("init", "-b", "main")
+    await _git("config", "user.email", "hermes-agent@local")
+    await _git("config", "user.name", "Hermes Agent")
+    await _git("commit", "--allow-empty", "-m", "Initial commit")
 
 
 async def _create_worktree(repo_path: str, branch: str, worktree_dir: Path) -> None:
-    """Create a git worktree for isolated development."""
+    """Create a git worktree for isolated development (non-blocking)."""
     try:
-        subprocess.run(
-            ["git", "-C", repo_path, "fetch", "origin"],
-            capture_output=True, text=True, timeout=30,
+        proc = await asyncio.create_subprocess_exec(
+            "git", "-C", repo_path, "fetch", "origin",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        subprocess.run(
-            ["git", "-C", repo_path, "worktree", "add", str(worktree_dir), "-b", branch, "origin/main"],
-            capture_output=True, text=True, timeout=30,
-            check=True,
+        await asyncio.wait_for(proc.communicate(), timeout=30)
+
+        proc = await asyncio.create_subprocess_exec(
+            "git", "-C", repo_path, "worktree", "add", str(worktree_dir), "-b", branch, "origin/main",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-    except subprocess.CalledProcessError as e:
-        logger.warning("Worktree creation failed: %s", e.stderr)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        if proc.returncode != 0:
+            raise RuntimeError(f"Worktree creation failed: {stderr.decode('utf-8', errors='replace')}")
+    except RuntimeError:
+        raise
+    except Exception as e:
+        logger.warning("Worktree creation failed: %s", e)
         raise
 
 
-async def _run_claude_code(
-    worktree_dir: Path,
-    prompt: str,
-    daemon: Any = None,
-    task_id: str | None = None,
-) -> dict[str, Any]:
-    """Run Claude Code CLI non-interactively.
-
-    If daemon and task_id are provided, registers the spawned subprocess
-    with the daemon so it can be killed on task cancellation/timeout.
-    """
-    import os
-    import sys
-    try:
-        # On Windows, resolve to claude.exe directly (shell script won't work, cmd.exe breaks UTF-8)
-        if sys.platform == "win32":
-            which_result = subprocess.run(
-                ["where", "claude"], capture_output=True, text=True, timeout=5
-            )
-            claude_exe = None
-            for line in which_result.stdout.strip().split("\n"):
-                line = line.strip()
-                if line.lower().endswith("claude.exe") or line.lower().endswith("claude.cmd"):
-                    claude_exe = line
-                    break
-            if claude_exe and claude_exe.lower().endswith(".cmd"):
-                # cmd points to node_modules, resolve actual exe
-                base_dir = os.path.dirname(claude_exe)
-                exe_path = os.path.join(base_dir, "node_modules", "@anthropic-ai", "claude-code", "bin", "claude.exe")
-                if os.path.exists(exe_path):
-                    claude_exe = exe_path
-            if not claude_exe:
-                claude_exe = "claude.exe"  # fallback to PATH lookup
-
-            # Pass UTF-8 env to subprocess
-            env = os.environ.copy()
-            env.setdefault("PYTHONUTF8", "1")
-            env.setdefault("PYTHONIOENCODING", "utf-8")
-
-            proc = await asyncio.create_subprocess_exec(
-                claude_exe, "-p", prompt, "--dangerously-skip-permissions",
-                cwd=str(worktree_dir),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-                env=env,
-            )
-        else:
-            proc = await asyncio.create_subprocess_exec(
-                "claude", "-p", prompt, "--dangerously-skip-permissions",
-                cwd=str(worktree_dir),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-
-        # Register subprocess for cancellation tracking
-        if daemon is not None and task_id is not None:
-            daemon.register_subprocess(task_id, proc)
-
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_get_timeout("claude_code_timeout", 1800))
-        return {
-            "stdout": stdout.decode()[:4096],
-            "stderr": stderr.decode()[:4096],
-            "exit_code": proc.returncode,
-        }
-    except FileNotFoundError:
-        return {"error": "claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code"}
-    except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        return {"error": "Claude Code timed out after 30 minutes"}
-
-
 async def _get_git_info(worktree_dir: Path) -> tuple[str, str]:
-    """Get git diff and latest commit SHA."""
+    """Get git diff and latest commit SHA (non-blocking)."""
     try:
-        sha = subprocess.run(
-            ["git", "-C", str(worktree_dir), "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=10,
+        proc = await asyncio.create_subprocess_exec(
+            "git", "-C", str(worktree_dir), "rev-parse", "HEAD",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        commit_sha = sha.stdout.strip()
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        commit_sha = stdout.decode("utf-8", errors="replace").strip()
         if not commit_sha:
             return "", ""
         # Try diff against parent commit
-        diff = subprocess.run(
-            ["git", "-C", str(worktree_dir), "diff", "--stat", "HEAD~1"],
-            capture_output=True, text=True, timeout=10,
+        proc = await asyncio.create_subprocess_exec(
+            "git", "-C", str(worktree_dir), "diff", "--stat", "HEAD~1",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        if diff.returncode != 0:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        output = stdout.decode("utf-8", errors="replace")
+        if proc.returncode != 0:
             # Fallback: show log of commits
-            diff = subprocess.run(
-                ["git", "-C", str(worktree_dir), "log", "--oneline", "--stat"],
-                capture_output=True, text=True, timeout=10,
+            proc = await asyncio.create_subprocess_exec(
+                "git", "-C", str(worktree_dir), "log", "--oneline", "--stat",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-        return diff.stdout.strip()[:4096], commit_sha
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            output = stdout.decode("utf-8", errors="replace")
+        return output.strip()[:4096], commit_sha
     except Exception:
         return "", ""
 
 
 async def _run_tests(worktree_dir: Path, test_cmd: str) -> dict[str, Any]:
-    """Run the configured test command."""
+    """Run the configured test command.
+
+    Uses shlex.split to safely parse the command string into arguments,
+    preventing shell injection from user-controlled test_command metadata.
+    """
+    import shlex
     try:
-        proc = await asyncio.create_subprocess_shell(
-            test_cmd,
+        args = shlex.split(test_cmd, posix=True)
+        if not args:
+            return {"error": "Empty test command"}
+        # Validate the command runner is a known test tool
+        runner = Path(args[0]).stem  # strip path prefix
+        _ALLOWED_RUNNERS = {
+            "pytest", "python", "python3", "npm", "npx", "yarn",
+            "cargo", "go", "mvn", "gradle", "make", "tox",
+        }
+        if runner not in _ALLOWED_RUNNERS:
+            return {"error": f"Disallowed test runner: {runner}. Allowed: {sorted(_ALLOWED_RUNNERS)}"}
+        proc = await asyncio.create_subprocess_exec(
+            *args,
             cwd=str(worktree_dir),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_get_timeout("test_timeout", 600))
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=get_timeout("test_timeout", 600))
         return {
             "exit_code": proc.returncode,
-            "output": stdout.decode()[:4096],
+            "output": stdout.decode("utf-8", errors="replace")[:4096],
         }
     except Exception as e:
         return {"error": str(e)}

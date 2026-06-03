@@ -151,7 +151,12 @@ def list_tasks(
     type: Optional[str] = Query(None),
 ):
     """List tasks with optional filters."""
-    s = TaskStatus(status) if status else None
+    s = None
+    if status:
+        try:
+            s = TaskStatus(status)
+        except ValueError:
+            raise HTTPException(422, f"Invalid status filter: {status}. Valid: {[s.value for s in TaskStatus]}")
     tasks = _ensure_db().list_tasks(status=s, task_type=type)
     return tasks
 
@@ -275,6 +280,25 @@ def get_task_history(task_id: str):
     return events
 
 
+def _validate_artifact_name(name: str) -> str:
+    """Sanitize artifact filename to prevent path traversal attacks.
+
+    Rejects names containing '..' separators or path separators.
+    Returns the sanitized name or raises HTTPException 422.
+    """
+    import re
+    # Block path traversal attempts
+    if ".." in name or "/" in name or "\\" in name:
+        raise HTTPException(422, f"Invalid artifact name: {name}")
+    # Block absolute paths and hidden files
+    if name.startswith(".") or name.startswith("/") or name.startswith("\\"):
+        raise HTTPException(422, f"Invalid artifact name: {name}")
+    # Allow only safe filename characters
+    if not re.match(r'^[a-zA-Z0-9_\-.]+$', name):
+        raise HTTPException(422, f"Invalid artifact name: {name}")
+    return name
+
+
 @app.get("/tasks/{task_id}/artifacts")
 def get_artifacts(task_id: str):
     """Read artifact files from disk."""
@@ -286,6 +310,11 @@ def get_artifacts(task_id: str):
     if workspace_dir.exists():
         for f in workspace_dir.iterdir():
             if f.is_file():
+                # Verify resolved path stays within artifacts directory
+                try:
+                    f.resolve().relative_to(workspace_dir.resolve())
+                except ValueError:
+                    continue
                 artifacts[f.name] = f.read_text(encoding="utf-8")
     return artifacts
 
@@ -308,11 +337,18 @@ def resolve_deps(task_id: str):
 @app.put("/tasks/{task_id}/artifacts/{name}")
 async def upload_artifact(task_id: str, name: str, request: Request):
     """Write artifact file to disk."""
+    safe_name = _validate_artifact_name(name)
     body = await request.body()
     workspace_dir = Path(cfg.get("workspace_dir", _default_workspace_dir())) / str(task_id) / "artifacts"
     workspace_dir.mkdir(parents=True, exist_ok=True)
-    (workspace_dir / name).write_bytes(body)
-    return {"status": "ok", "path": str(workspace_dir / name)}
+    target = (workspace_dir / safe_name).resolve()
+    # Verify resolved path stays within artifacts directory
+    try:
+        target.relative_to(workspace_dir.resolve())
+    except ValueError:
+        raise HTTPException(422, "Artifact path escapes workspace")
+    target.write_bytes(body)
+    return {"status": "ok", "path": str(target)}
 
 
 # -- health --------------------------------------------------------------------

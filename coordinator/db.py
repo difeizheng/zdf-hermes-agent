@@ -146,7 +146,6 @@ class TaskDB:
         assigned_to: Optional[str] = None,
     ) -> Optional[Task]:
         with self._lock:
-            now = "CURRENT_TIMESTAMP"
             fields = []
             vals: list[object] = []
             if status == TaskStatus.RUNNING:

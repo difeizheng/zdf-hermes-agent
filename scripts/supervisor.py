@@ -278,7 +278,8 @@ def _launch(proc: ProcessDef, log_file: Path, detach: bool = False, create_sessi
     env.setdefault("NO_PROXY", "127.0.0.1,localhost")
 
     # Use project venv python to ensure dependencies (uvicorn, httpx) are available
-    venv_python = Path(__file__).resolve().parent.parent / ".venv" / "Scripts" / "python.exe"
+    venv_bin = "Scripts" if sys.platform == "win32" else "bin"
+    venv_python = Path(__file__).resolve().parent.parent / ".venv" / venv_bin / ("python.exe" if sys.platform == "win32" else "python")
     python_exe = venv_python if venv_python.exists() else sys.executable
 
     if proc.module:
@@ -349,7 +350,7 @@ def _wait_for_coordinator(url: str, timeout: int = 30) -> bool:
 
 def stop() -> None:
     """Stop all managed processes."""
-    names = ["coordinator"] + [f"agent-{t}" for t in AGENT_TYPES]
+    names = ["coordinator"] + [f"agent-{t}" for t in AGENT_TYPES] + ["progress-watcher"]
     stopped = []
 
     for name in names:
@@ -400,7 +401,7 @@ def stop() -> None:
 
 def status() -> None:
     """Show status of all managed processes."""
-    names = ["coordinator"] + [f"agent-{t}" for t in AGENT_TYPES]
+    names = ["coordinator"] + [f"agent-{t}" for t in AGENT_TYPES] + ["progress-watcher"]
     any_running = False
 
     for name in names:

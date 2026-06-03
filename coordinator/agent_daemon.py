@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import signal
 from typing import Any
@@ -58,7 +59,6 @@ class AgentDaemon:
         # Bypass system proxy for local coordinator connections (Windows issue)
         import os
         os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost")
-        import sys
         if sys.platform != "win32":
             loop = asyncio.get_event_loop()
             for sig in (signal.SIGINT, signal.SIGTERM):
@@ -80,7 +80,6 @@ class AgentDaemon:
                                 break
                             if not line or not line.startswith("data:"):
                                 continue
-                            import json
                             payload = json.loads(line[5:])
                             if payload.get("type") == "created":
                                 task_id = payload.get("task_id")

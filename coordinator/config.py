@@ -6,14 +6,27 @@ Loads from ~/.hermes/config.yaml under "orchestrator" key.
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from pathlib import Path
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
 
 def _hermes_home() -> Path:
-    """Profile-safe Hermes home directory."""
+    """Profile-safe Hermes home directory.
+
+    Prefers hermes_constants.get_hermes_home() which handles
+    profile-aware paths and data-corruption warnings. Falls back
+    to HERMES_HOME env var then ~/.hermes.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+        return get_hermes_home()
+    except ImportError:
+        pass
     env = os.environ.get("HERMES_HOME")
     if env:
         return Path(env)
@@ -60,7 +73,7 @@ def load_config() -> dict[str, Any]:
             if isinstance(override, dict):
                 defaults.update(override)
         except Exception:
-            pass
+            logger.warning("Config load failed", exc_info=True)
 
     return defaults
 
@@ -258,34 +271,6 @@ def _llm_from_provider(
             result["api_key"] = resolved
 
     return result
-    """Load orchestrator config from ~/.hermes/config.yaml."""
-    cfg_path = _hermes_home() / "config.yaml"
-    defaults = {
-        "port": 9100,
-        "db_path": str(_hermes_home() / "tasks.db"),
-        "heartbeat_interval": 60,
-        "stale_timeout": 120,
-        "workspace_dir": _default_workspace_dir(),
-        "max_retries": 0,
-        "retry_delay": 30,
-        "profile": "tdd-developer",  # Default profile for dev tasks
-        "quality_gate_enabled": True,
-        "min_coverage": 80.0,
-        "max_critical_issues": 0,
-        "max_high_issues": 2,
-    }
-    if cfg_path.exists():
-        try:
-            import yaml
-            with open(cfg_path, encoding="utf-8-sig") as f:
-                raw = yaml.safe_load(f) or {}
-            override = raw.get("orchestrator", {})
-            if isinstance(override, dict):
-                defaults.update(override)
-        except Exception:
-            pass
-
-    return defaults
 
 
 def init_memory_if_needed(workspace_dir: str) -> None:
