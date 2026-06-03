@@ -40,64 +40,65 @@ logger = logging.getLogger(__name__)
 # -- DingTalk sender abstraction -------------------------------------------
 
 class _DingTalkSender:
-    """Lazy-init wrapper around the DingTalk platform's send() method.
+    """Lazy-init wrapper around a DingTalk group-bot webhook for one-way
+    progress pushes.
 
-    If the gateway can't be imported (e.g., missing deps), falls back to
-    logging-only mode so the watcher never crashes.
+    Why a webhook and not ``DingTalkAdapter``:
+      The gateway's DingTalkAdapter is a stream-mode reply client — it
+      requires an incoming ``session_webhook`` to reply to, and the
+      watcher has no inbound context. The webhook module is stateless
+      and works without any DingTalk app permissions. See
+      ``coordinator/dingtalk_webhook.py`` for the long version.
+
+    Falls back to logging-only mode if no webhook URL is configured,
+    so the watcher never crashes.
     """
 
     def __init__(self) -> None:
-        self._platform = None
-        self._init_attempted = False
-        self._available = False
+        self._webhook_url: str = ""
+        self._init_attempted: bool = False
+        self._available: bool = False
 
     def _try_init(self) -> None:
         if self._init_attempted:
             return
         self._init_attempted = True
         try:
-            from gateway.platforms.dingtalk import DingTalkPlatform
-            from plugins.orchestrator.config import load_orchestrator_config
-            import yaml
-
+            # Config file takes precedence; env var is the fallback.
+            explicit: str | None = None
             cfg_path = Path.home() / ".hermes" / "config.yaml"
-            if not cfg_path.exists():
-                logger.warning("Config not found at %s, watcher in log-only mode", cfg_path)
+            if cfg_path.exists():
+                import yaml
+
+                with open(cfg_path, encoding="utf-8-sig") as f:
+                    raw = yaml.safe_load(f) or {}
+                orch_cfg = raw.get("orchestrator", {})
+                explicit = orch_cfg.get("progress_webhook") or None
+
+            from coordinator.dingtalk_webhook import resolve_webhook_url
+            self._webhook_url = resolve_webhook_url(explicit)
+            if not self._webhook_url:
+                logger.warning(
+                    "No DingTalk progress webhook configured "
+                    "(set orchestrator.progress_webhook in config.yaml or "
+                    "DINGTALK_PROGRESS_WEBHOOK env var) — log-only mode"
+                )
                 return
-
-            with open(cfg_path, encoding="utf-8-sig") as f:
-                raw = yaml.safe_load(f) or {}
-            dingtalk_cfg = raw.get("platforms", {}).get("dingtalk", {})
-            extra = dingtalk_cfg.get("extra", {})
-
-            client_id = os.environ.get("DINGTALK_CLIENT_ID") or extra.get("client_id", "")
-            client_secret = os.environ.get("DINGTALK_CLIENT_SECRET") or extra.get("client_secret", "")
-            if not client_id or not client_secret:
-                logger.warning("DingTalk credentials not found, watcher in log-only mode")
-                return
-
-            self._platform = DingTalkPlatform(
-                name="progress-watcher",
-                config={"client_id": client_id, "client_secret": client_secret},
-            )
             self._available = True
-            logger.info("DingTalk platform initialized for progress watcher")
+            logger.info("DingTalk progress webhook initialized")
         except Exception as e:
-            logger.warning("Failed to init DingTalk platform: %s — log-only mode", e)
+            logger.warning("Failed to init DingTalk webhook: %s — log-only mode", e)
 
     async def send(self, chat_id: str, text: str) -> bool:
         self._try_init()
-        if not self._available or self._platform is None:
+        if not self._available or not self._webhook_url:
             logger.info("[log-only] would send to %s: %s", chat_id, text[:80])
             return False
         try:
-            result = await self._platform.send(chat_id, text)
-            if not getattr(result, "success", False):
-                logger.warning("DingTalk send failed: %s", getattr(result, "error", "unknown"))
-                return False
-            return True
+            from coordinator.dingtalk_webhook import post_markdown
+            return await post_markdown(self._webhook_url, text, title="Hermes")
         except Exception as e:
-            logger.warning("DingTalk send exception: %s", e)
+            logger.warning("DingTalk webhook send exception: %s", e)
             return False
 
 

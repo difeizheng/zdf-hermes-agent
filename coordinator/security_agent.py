@@ -329,7 +329,7 @@ def _build_security_prompt(
         "",
         "## Automated Scan Results",
         "",
-    ]
+    ])
 
     if scan_results.get("bandit"):
         bandit_data = scan_results["bandit"]

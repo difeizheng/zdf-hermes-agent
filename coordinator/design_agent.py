@@ -94,7 +94,9 @@ async def run_design_task(
     user_content = description
     if memory_context:
         user_content = f"{memory_context}\n\n---\n\n{description}"
-    artifacts = await _call_claude_api(system_prompt, user_content)
+    # Pass description separately so the mock fallback doesn't echo the
+    # memory-laden user_content into prd.md (Round 9-bugfix regression guard).
+    artifacts = await _call_claude_api(system_prompt, user_content, description=description)
 
     # Resolve actual model used for metadata
     llm = _load_llm_config()
@@ -133,7 +135,12 @@ async def _send_heartbeat(task_id: str, coordinator_url: str) -> None:
         await asyncio.sleep(30)
 
 
-async def _call_claude_api(system_prompt: str, user_content: str) -> dict[str, str]:
+async def _call_claude_api(
+    system_prompt: str,
+    user_content: str,
+    *,
+    description: str = "",
+) -> dict[str, str]:
     """Call LLM API and parse response into artifacts.
 
     Reads model, api_key, base_url from config.yaml orchestrator.design_llm.
@@ -141,7 +148,9 @@ async def _call_claude_api(system_prompt: str, user_content: str) -> dict[str, s
       - Direct: model + api_key_env + optional base_url
       - Provider reference: provider=<custom_provider name> + model
 
-    Falls back to mock artifacts if API key is not configured.
+    Falls back to mock artifacts if API key is not configured. The mock
+    path intentionally receives only ``description`` (not ``user_content``,
+    which contains memory context) so it cannot echo memory into prd.md.
     """
     llm = _load_llm_config()
     api_key = llm.get("api_key")
@@ -151,7 +160,7 @@ async def _call_claude_api(system_prompt: str, user_content: str) -> dict[str, s
 
     if not api_key:
         logger.info("No API key configured for design LLM, using mock artifacts")
-        return _mock_artifacts(system_prompt, user_content)
+        return _mock_artifacts(description=description)
 
     try:
         import anthropic
@@ -178,7 +187,7 @@ async def _call_claude_api(system_prompt: str, user_content: str) -> dict[str, s
 
     except Exception as e:
         logger.warning("LLM API call failed (model=%s): %s", model, e)
-        return _mock_artifacts(system_prompt, user_content)
+        return _mock_artifacts(description=description)
 
 
 def _parse_artifacts(text: str) -> dict[str, str]:
@@ -236,47 +245,60 @@ def _parse_artifacts(text: str) -> dict[str, str]:
     return sections
 
 
-def _mock_artifacts(system_prompt: str, user_content: str) -> dict[str, str]:
-    """Generate mock design artifacts for development/testing."""
+def _mock_artifacts(system_prompt: str = "", *, description: str = "") -> dict[str, str]:
+    """Generate mock design artifacts for development/testing.
+
+    This fallback is only used when no ANTHROPIC_API_KEY is configured
+    (or the LLM call fails). The mock MUST NOT echo the memory-laden
+    ``user_content`` that the real LLM path receives — doing so would
+    dump the entire error/decision memory into prd.md, which is what
+    Round 9 caught in production.
+
+    The first sentence of the task ``description`` is used as a title
+    hint. All other content is generic placeholder. Output files are
+    marked with a ⚠️ MOCK banner so downstream consumers (and humans)
+    immediately know the content is not real.
+    """
+    first_sentence = (description or "系统设计任务").split("。")[0][:50]
+    if not first_sentence.strip():
+        first_sentence = "系统设计任务"
+
+    mock_banner = "⚠️ MOCK ARTIFACT — no ANTHROPIC_API_KEY configured"
+
     return {
         "prd.md": (
-            f"# PRD: {user_content}\n\n"
+            f"# PRD ({mock_banner})\n\n"
+            f"任务：{first_sentence}\n\n"
             "## Requirements\n"
-            "- User authentication and authorization\n"
-            "- CRUD operations for user management\n"
-            "- Role-based access control\n\n"
+            "- (待 LLM 调用生成真实需求 — 当前走 mock 路径)\n"
+            "- 用户认证与授权\n"
+            "- 基础 CRUD 操作\n\n"
             "## Acceptance Criteria\n"
-            "- Users can be created, read, updated, deleted\n"
-            "- Password hashing with bcrypt\n"
-            "- API rate limiting\n"
+            "- (待 LLM 调用生成真实验收标准)\n"
+            "- 关键功能端到端可演示\n"
         ),
         "architecture.md": (
-            "# Architecture\n\n"
+            f"# Architecture ({mock_banner})\n\n"
             "## Components\n"
             "- API Gateway\n"
-            "- User Service\n"
-            "- Database (PostgreSQL)\n\n"
+            "- Service Layer\n"
+            "- Database\n\n"
             "## Technology Stack\n"
-            "- Backend: FastAPI\n"
-            "- Database: PostgreSQL with asyncpg\n"
-            "- Auth: JWT tokens\n"
+            "- Backend: (待 LLM 选定 — 建议 FastAPI)\n"
+            "- Database: (待 LLM 选定)\n"
+            "- Auth: (待 LLM 选定)\n"
         ),
         "system_design.md": (
-            "# System Design\n\n"
+            f"# System Design ({mock_banner})\n\n"
             "## Data Model\n"
             "```sql\n"
-            "CREATE TABLE users (\n"
+            "-- (待 LLM 生成真实 schema)\n"
+            "CREATE TABLE placeholder (\n"
             "    id UUID PRIMARY KEY,\n"
-            "    email VARCHAR(255) UNIQUE NOT NULL,\n"
-            "    password_hash VARCHAR(255) NOT NULL,\n"
-            "    role VARCHAR(50) DEFAULT 'user',\n"
             "    created_at TIMESTAMP DEFAULT NOW()\n"
             ");\n"
             "```\n\n"
             "## API Endpoints\n"
-            "- POST /api/users\n"
-            "- GET /api/users/{id}\n"
-            "- PUT /api/users/{id}\n"
-            "- DELETE /api/users/{id}\n"
+            "- (待 LLM 生成真实接口列表)\n"
         ),
     }
