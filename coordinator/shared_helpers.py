@@ -48,6 +48,18 @@ def get_max_validate_retries() -> int:
         return 3
 
 
+def get_max_pipeline_retries() -> int:
+    """Global cap on total retries across the entire pipeline.
+
+    Prevents unbounded retry chains even if per-phase counters allow more.
+    Design spec: per-phase max 3, total max 5.
+    """
+    try:
+        return int(load_config().get("max_pipeline_retries", 5))
+    except Exception:
+        return 5
+
+
 def get_workspace_dir(cfg: dict[str, Any] | None = None) -> str:
     """Get workspace directory from config or default."""
     if cfg is None:

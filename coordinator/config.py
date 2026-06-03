@@ -287,9 +287,15 @@ def init_memory_if_needed(workspace_dir: str) -> None:
 
 
 def get_profile_config(profile_name: str) -> dict[str, Any] | None:
-    """Get profile configuration by name."""
-    from coordinator.profiles import get_profile
+    """Get profile configuration by name.
+
+    Returns the profile as a dict with all fields plus a ``prompt_context``
+    key containing the full formatted prompt from profile_to_prompt().
+    """
+    from coordinator.profiles import get_profile, profile_to_prompt
     profile = get_profile(profile_name)
     if profile:
-        return profile.to_dict()
+        result = profile.to_dict()
+        result["prompt_context"] = profile_to_prompt(profile)
+        return result
     return None

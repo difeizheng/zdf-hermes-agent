@@ -20,7 +20,8 @@ from typing import Any
 from coordinator.shared_heartbeat import start_heartbeat
 from coordinator.shared_claude_cli import run_claude_cli
 from coordinator.shared_helpers import (
-    get_timeout, get_max_validate_retries, get_quality_thresholds, get_workspace_dir,
+    get_timeout, get_max_validate_retries, get_max_pipeline_retries,
+    get_quality_thresholds, get_workspace_dir,
 )
 
 logger = logging.getLogger(__name__)
@@ -242,12 +243,14 @@ async def _execute_validate(
     if review_status == "failed":
         retry_info = validate_task.get("metadata", {}).get("retry_info", {})
         attempt = retry_info.get("attempt", 0) + 1
+        total_pipeline_retries = retry_info.get("total_pipeline_retries", 0) + 1
+        max_per_phase = get_max_validate_retries()
+        max_pipeline = get_max_pipeline_retries()
 
-        if attempt <= get_max_validate_retries():
+        if attempt <= max_per_phase and total_pipeline_retries <= max_pipeline:
             logger.info(
-                "Validation failed (attempt %d/%d), creating retry tasks",
-                attempt,
-                get_max_validate_retries(),
+                "Validation failed (attempt %d/%d, pipeline %d/%d), creating retry tasks",
+                attempt, max_per_phase, total_pipeline_retries, max_pipeline,
             )
             # Determine retry focus based on gate reasons
             security_failed = bool(security_result and not security_result.get("security_passed", True))
@@ -261,15 +264,17 @@ async def _execute_validate(
                     design_task_id=design_task_id,
                     feedback=review_text[:4000],
                     attempt=attempt,
+                    total_pipeline_retries=total_pipeline_retries,
                     security_failed=security_failed,
                     qa_failed=qa_failed,
                 )
             except Exception as e:
                 logger.warning("Failed to create retry tasks: %s", e)
         else:
+            reason = "per-phase" if attempt > max_per_phase else "pipeline"
             logger.warning(
-                "Max retries (%d) reached for validate %s, escalating",
-                get_max_validate_retries(), task_id[:8],
+                "Max retries reached for validate %s (%s: attempt=%d/%d pipeline=%d/%d), escalating",
+                task_id[:8], reason, attempt, max_per_phase, total_pipeline_retries, max_pipeline,
             )
             # Attempt escalation: notify via DingTalk webhook if configured
             try:
@@ -280,9 +285,10 @@ async def _execute_validate(
                         post_markdown,
                         webhook_url,
                         f"⚠️ Pipeline 升级通知",
-                        f"任务 {task_id[:8]} 验证失败已达上限 ({get_max_validate_retries()} 次)\n\n"
+                        f"任务 {task_id[:8]} 验证失败已达上限\n\n"
                         f"**dev_task**: `{dev_task_id[:8]}`\n"
                         f"**设计任务**: `{design_task_id}`\n\n"
+                        f"**重试**: per-phase {attempt}/{max_per_phase}, pipeline {total_pipeline_retries}/{max_pipeline}\n\n"
                         f"**失败原因**:\n{chr(10).join(f'- {r}' for r in gate_reasons[:5])}\n\n"
                         f"需人工介入审查。",
                     )
@@ -290,7 +296,7 @@ async def _execute_validate(
             except Exception as e:
                 logger.warning("Failed to send escalation notification: %s", e)
 
-    return_result = {
+    return_result: dict[str, Any] = {
         "artifacts": {
             "review": str(artifact_dir / "review.md"),
         },
@@ -300,9 +306,13 @@ async def _execute_validate(
             "design_task_id": design_task_id,
         },
     }
+
     # When validation fails, return with error field so agent_daemon marks task as FAILED
     # (not COMPLETED). This ensures the retry chain is properly triggered.
     if review_status == "failed":
+        # Mark escalation status when retries are exhausted
+        if attempt > max_per_phase or total_pipeline_retries > max_pipeline:
+            return_result["metadata"]["escalation"] = "FAILED_WITH_ESCALATION"
         return_result["error"] = f"validation_failed: {review_text[:200]}"
 
     return return_result
@@ -455,6 +465,7 @@ async def _create_targeted_retry_tasks(
     design_task_id: str | None,
     feedback: str,
     attempt: int,
+    total_pipeline_retries: int = 1,
     security_failed: bool = False,
     qa_failed: bool = False,
 ) -> dict[str, Any]:
@@ -491,6 +502,8 @@ async def _create_targeted_retry_tasks(
     fix_instructions.append(f"## Detailed Feedback\n{feedback}")
 
     # 1. Create dev_retry
+    # On the last retry before escalation, signal for stronger model usage
+    is_last_retry = attempt >= get_max_validate_retries() or total_pipeline_retries >= get_max_pipeline_retries()
     dev_retry_body = {
         "type": "dev",
         "title": f"修复: {original_title} (第{attempt}次)",
@@ -500,6 +513,7 @@ async def _create_targeted_retry_tasks(
             "is_retry": True,
             "original_dev_id": dev_task_id,
             "retry_attempt": attempt,
+            **({"escalation_retry": True} if is_last_retry else {}),
         },
     }
 
@@ -553,13 +567,14 @@ async def _create_targeted_retry_tasks(
     validate_retry_body = {
         "type": "validate",
         "title": f"验证修复: {original_title} (第{attempt}次)",
-        "description": f"Verify all fixes. Retry attempt {attempt}/{get_max_validate_retries()}.",
+        "description": f"Verify all fixes. Retry attempt {attempt}/{get_max_validate_retries()}, pipeline {total_pipeline_retries}/{get_max_pipeline_retries()}.",
         "depends_on": retry_dep_ids,
         "metadata": {
             "is_retry": True,
             "retry_info": {
                 "attempt": attempt,
                 "original_validate_id": validate_task_id,
+                "total_pipeline_retries": total_pipeline_retries,
             },
         },
     }

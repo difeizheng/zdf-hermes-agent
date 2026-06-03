@@ -231,6 +231,9 @@ def _build_security_prompt(
             parts.append("")
             parts.append(profile["behavior"])
             parts.append("")
+        if profile.get("skills"):
+            parts.append(f"Active skills: {', '.join(profile['skills'])}")
+            parts.append("")
         if profile.get("rules"):
             parts.append(f"Rules enforced: {', '.join(profile['rules'])}")
             parts.append("")
@@ -336,12 +339,18 @@ def _parse_security_result(text: str, scan_results: dict[str, Any]) -> tuple[int
             elif severity == "MEDIUM":
                 issues.append(f"[Bandit MEDIUM] {issue.get('issue_text', '')}")
 
-    # Add hardcoded secrets findings — count as HIGH, not CRITICAL,
-    # to avoid false positives inflating the gate (audit P7 fix).
+    # Add hardcoded secrets findings — classify by severity.
+    # "password"/"credential"/"api_key"/"token" → HIGH (auth-related).
+    # "secret" alone → MEDIUM (may be internal/non-production).
+    # This avoids inflating the quality gate on ambiguous findings (audit P7 fix).
     if scan_results.get("hardcoded_secrets"):
         for finding in scan_results["hardcoded_secrets"]:
-            high += 1
-            issues.append(f"[HIGH] Hardcoded secret: {finding[:100]}")
+            finding_lower = finding.lower()
+            if any(kw in finding_lower for kw in ("password", "credential", "api_key", "token")):
+                high += 1
+                issues.append(f"[HIGH] Hardcoded secret: {finding[:100]}")
+            else:
+                issues.append(f"[MEDIUM] Hardcoded secret: {finding[:100]}")
 
     return critical, high, issues
 

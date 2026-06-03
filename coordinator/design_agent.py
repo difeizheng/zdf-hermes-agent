@@ -81,9 +81,11 @@ async def _execute_design(
     if profile:
         behavior = profile.get("behavior", "")
         rules_str = ", ".join(profile.get("rules", []))
+        skills_str = ", ".join(profile.get("skills", []))
         output = profile.get("output", "")
         system_prompt = (
             f"You are a senior software architect. {behavior}\n\n"
+            f"Active skills: {skills_str}\n\n"
             f"Rules: {rules_str}\n\n"
             f"Expected output: {output}\n\n"
             "Structure your response with these sections:\n\n"
@@ -212,10 +214,13 @@ def _parse_artifacts(text: str) -> dict[str, str]:
     for line in text.split("\n"):
         header_match = re.match(r'^(#{1,4})\s+(.+)', line)
         if header_match:
-            # Save previous section
+            # Save previous section — merge if same filename already has content
             content = "\n".join(current_lines).strip()
             if content:
-                sections[current_name] = content
+                if current_name in sections:
+                    sections[current_name] = sections[current_name] + "\n\n" + content
+                else:
+                    sections[current_name] = content
             # Determine filename from header text
             header_text = header_match.group(2).strip().lower()
             current_name = "full_design.md"  # default
