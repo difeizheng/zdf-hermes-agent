@@ -2,6 +2,8 @@
 
 [SimpleX Chat](https://simplex.chat/) is a private, decentralised messaging platform where users own their contacts and groups. Unlike other platforms, SimpleX assigns no persistent user IDs — every contact is identified by an opaque internal ID generated at connection time, which makes it one of the most private messengers available.
 
+> Run `hermes gateway setup` and pick **SimpleX** for a guided walk-through.
+
 ## Prerequisites
 
 - The **simplex-chat** CLI installed and running as a daemon
@@ -9,16 +11,15 @@
 
 ## Install simplex-chat
 
-Download the latest release from the [simplex-chat GitHub releases](https://github.com/simplex-chat/simplex-chat/releases) page, or via Docker:
+Download the latest release from the [simplex-chat GitHub releases](https://github.com/simplex-chat/simplex-chat/releases) page:
 
 ```bash
 # Linux / macOS binary
-curl -L https://github.com/simplex-chat/simplex-chat/releases/latest/download/simplex-chat-ubuntu-22_04-x86-64 -o simplex-chat
+curl -L https://github.com/simplex-chat/simplex-chat/releases/latest/download/simplex-chat-ubuntu-22_04-x86_64 -o simplex-chat
 chmod +x simplex-chat
-
-# Or Docker
-docker run -p 5225:5225 simplexchat/simplex-chat -p 5225
 ```
+
+The SimpleX Chat project does not publish a prebuilt Docker image for the chat client; to run it under Docker, build from source from the [simplex-chat repository](https://github.com/simplex-chat/simplex-chat).
 
 ## Start the daemon
 
@@ -33,7 +34,7 @@ The daemon listens on WebSocket at `ws://127.0.0.1:5225` by default.
 ### Via setup wizard
 
 ```bash
-hermes setup gateway
+hermes gateway setup
 ```
 
 Select **SimpleX Chat** and follow the prompts.
@@ -51,21 +52,21 @@ SIMPLEX_HOME_CHANNEL=<contact-id>
 | Variable | Required | Description |
 |---|---|---|
 | `SIMPLEX_WS_URL` | Yes | WebSocket URL of the simplex-chat daemon |
-| `SIMPLEX_ALLOWED_USERS` | Recommended | Comma-separated contact IDs allowed to use the agent |
+| `SIMPLEX_ALLOWED_USERS` | Recommended | Comma-separated allowlist. Each entry can be a numeric `contactId` **or** a display name — both forms work. |
 | `SIMPLEX_ALLOW_ALL_USERS` | Optional | Set `true` to allow every contact (use carefully) |
 | `SIMPLEX_HOME_CHANNEL` | Optional | Default contact ID for cron job delivery |
 | `SIMPLEX_HOME_CHANNEL_NAME` | Optional | Human label for the home channel |
 
-## Find your contact ID
+## Find your contact ID or display name
 
-After starting the daemon, open a conversation with your agent contact. The contact ID will appear in session logs or via `hermes send_message action=list`.
+After starting the daemon, open a conversation with your agent contact. The numeric `contactId` appears in session logs or via `hermes send_message action=list`. If you'd rather use the display name shown in the SimpleX UI, that works too — `SIMPLEX_ALLOWED_USERS` accepts either form.
 
 ## Authorization
 
 By default **all contacts are denied**. You must either:
 
-1. Set `SIMPLEX_ALLOWED_USERS` to a comma-separated list of contact IDs, or
-2. Use **DM pairing** — send any message to the bot and it will reply with a pairing code. Enter that code via `hermes gateway pair`.
+1. Set `SIMPLEX_ALLOWED_USERS` to a comma-separated list of `contactId`s and/or display names (e.g. `SIMPLEX_ALLOWED_USERS=4,alice` matches either contactId 4 or the contact whose display name is "alice"), or
+2. Use **DM pairing** — send any message to the bot and it will reply with a pairing code. Enter that code via `hermes pairing approve simplex <CODE>`.
 
 ## Using SimpleX with cron jobs
 
